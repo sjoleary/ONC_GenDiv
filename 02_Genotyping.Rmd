@@ -1,0 +1,3794 @@
+---
+title: "Data acquisition and processing: Genotyping"
+subtitle: "Central Valley Chinook Salmon"
+author: "SJ O'Leary"
+date: "`r Sys.Date()`"
+output: tint::tintHtml
+bibliography: ONC.bib
+link-citations: yes
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+
+# load libraries and functions ====
+
+# load libraries
+library(tint)
+library(knitr)
+library(glue)
+library(plyr)
+library(magrittr)
+library(tidyverse)
+library(adegenet)
+library(hierfstat)
+library(pegas)
+library(radiator)
+library(vcfR)
+
+# load custom functions
+source("scr/ggplot.R")
+source("scr/xtrafunctions.R")
+source("scr/VCFfilterstats.R")
+source("scr/HaplotypR.R")
+source("scr/genind.R")
+source("scr/PCA.R")
+
+
+# OTHER OPTIONS ====
+
+# set how numbers are printed
+options(scipen=999)
+
+# invalidate cache when the package version changes
+knitr::opts_chunk$set(
+	message = FALSE,
+	warning = FALSE,
+	cache.extra = packageVersion("tint"),
+	tidy = FALSE,
+	echo = FALSE
+)
+
+options(htmltools.dir.version = FALSE)
+
+
+# tributaries
+tributaries <- c("USR", "BTC", "COL", "MIL", "DER", # Sacramento
+                 "BUT", "FRH", "NIM", "MKH",        # Sacramento
+                 "STN", "TOU", "MRH", "MER")        # San Juaquin
+
+```
+
+# Map reads to reference genome
+
+## Reference genome
+
+Downloaded from NCBI (https://www.ncbi.nlm.nih.gov/assembly/GCF_002872995.1/) [@Christensen2018], consisting of 34 chromosomes and 13,995 unplaced sequences.
+
+Unzip and rename (needs to be indexed etc. for read mapping and SNP calling).
+
+```{bash eval=FALSE, echo=TRUE}
+
+$HOME/CHINOOK/data/REF/CHRIST2018
+
+# unzip genome file
+gunzip GCF_002872995.1_Otsh_v1.0_genomic.fna.gz
+
+# rename
+mv GCF_002872995.1_Otsh_v1.0_genomic.fna Otsh_v1.0.fasta
+
+```
+
+**Genome assembly stats**:
+
+* Total sequence length: 2,425,713,975
+* Total ungapped length: 2,359,046,630
+* Gaps between scaffolds: 1,916
+* Number of scaffolds: 15,946
+* Scaffold N50: 1,728,323
+* Scaffold L50: 336
+* Number of contigs: 69,485
+* Contig N50: 133,169
+* Contig L50: 4,051
+* Total number of chromosomes and plasmids: 35
+* Number of component sequences (WGS or clone): 15,946
+
+
+## Map reads
+
+Any renaming of files needs to happen before `fastq`-files are mapped. The population designation (before underscore) is used by `freebayes` to call SNPs so it is important that population designation make biological sense. Here, all individuals are being grouped into a single group `ONC_`.
+
+Transfer copy of `reference.fasta` (rename genome `fasta` file) and associated files into library directories with demultiplexed and quality trimmed sequences, then run `dDocent` from within each `data/SEQ` directory to map reads to reference genome (`map.slurm`).
+
+`dDocent` wraps `BWA` [@Li2009] to map reads; parameters used: `bwa mem -L 20,5 -t 35 -a -M -T 10 -A 1 -B 9 -O 9 -R`; `dDocent` filters reads that are unmapped or ambiguously mapped (MAPQ > 1).
+
+```{bash eval=FALSE, echo=TRUE}
+
+# navigate to starting directory
+cd $HOME/CHINOOK/data/SEQ/
+
+for i in BMAG*; do
+
+    cd $HOME/CHINOOK/data/SEQ/$i
+
+    ## PREP FILES ----
+
+    # copy of configuration file
+    cp $HOME/CHINOOK/scr/map.config .
+
+    # copy of reference and associated files
+    cp $HOME/CHINOOK/data/REF/CHRIST2018/reference.* .
+
+    # make sure path correct to find conda
+    export PATH=$PATH:$HOME/miniconda3/bin
+
+    ## RUN dDOCENT ----
+
+    # open bioconda environment
+    source activate $HOME/miniconda3/envs/ddocent_env
+
+        # run dDocent to quality trim & map reads to reference genome
+        dDocent map.config
+
+    # close bioconda environment
+    source deactivates
+
+    rm $i/cat-RRG.bam*
+
+done
+
+```
+
+To run on HPCC need to use `SLURM` scripts to queue job, load modules, and activate `dDocent Bioconda environment` which contains all the necessary programs/software for the SNP calling pipeline. Move `slurm` output to scratch folder to be able to refer to run length/resources needed; remove unnecessary intermediate files.
+
+Remove reads that map with mapping quality < 5, create a `bamlist.list` file containing all names (paths) for each bam file, then concatenate all filtered `bam`-files into single `bam`-file and use `bedtools` to query coverage per interval.
+
+```{bash eval=FALSE, echo=TRUE}
+
+# navigate to project directory
+cd $HOME/CHINOOK/
+
+# load modules
+module purge
+module load GCC/6.4.0-2.28 OpenMPI/2.1.2
+module load SAMtools/1.9
+
+# create concatenated bam file
+samtools merge --threads 40 -b data/SEQ/bamlist.list -f data/SNP_CALLING/cat-RRG.bam
+samtools index data/SNP_CALLING/cat-RRG.bam
+
+# get coverage of concatenated file
+module purge
+module load GCC/4.9.3-2.25  OpenMPI/1.10.2
+module load BEDTools/2.26.0
+
+bedtools genomecov -ibam data/SNP_CALLING/cat-RRG.bam -bga > results/all_lib_filtered.coverage
+
+```
+
+
+## Compare mapping intervals to identify putative loci
+
+Removing reads with low mapping quality and intervals with low coverage will increase computational efficiency by removing extraneous reads and regions that are not consistently recovered.
+
+```{r}
+
+cov <- read_delim("results/all_lib_filtered.coverage", delim = "\t",
+                  col_names = c("chrom", "chromStart", "chromEnd", "coverage")) %>%
+            mutate(length = chromEnd-chromStart,
+                   cov_bin = case_when(coverage == 0 ~ "0",
+                                   coverage > 0 & coverage <= 50 ~ "<50",
+                                   coverage > 50 ~ ">50"))
+
+kable(
+   cov %>%
+      count(cov_bin) %>%
+      mutate(cov_bin = ordered(cov_bin, levels = c(">50", "<50", "0"))) %>%
+      arrange(cov_bin),
+   caption = "Table 1a: Number of features (intervals) for each coverage bin."
+    )
+
+intervals <- cov %>%
+    filter(coverage > 50) %>%
+    select(chrom, chromStart, chromEnd)
+
+write_delim(intervals, "results/concat_bam_intervals.bed", delim = "\t", col_names = FALSE)
+
+```
+Retain only intervals with coverage > 50.
+
+During coverage extraction intervals can be split up because reads do not stack up cleanly, i.e. mapping intervals will split into multiple adjacent intervals. Use `bedtools` to merge adjacent intervals (up to 15bp gap).
+
+```{bash eval=FALSE, echo=TRUE}
+
+# load modules
+module purge
+module load GCC/4.9.3-2.25  OpenMPI/1.10.2
+module load BEDTools/2.26.0
+
+# go to project directory
+cd $HOME/CHINOOK
+
+# merge adjacent intervals
+bedtools merge -d 15 -i results/concat_bam_intervals.bed > results/merged_mapping_intervals.bed
+
+```
+
+Compare depth distribution for merged mapping intervals.
+
+```{r fig.cap="Fig 1: Distribution of mapping interval length for merged intervals. Red dashed line indicates 300bp length fragments. Filtered reads are expected to be between 75-100bp in length.", fig.width=5, fig.height=5}
+
+bed <- read_delim("results/merged_mapping_intervals.bed", delim = "\t",
+                  col_names = c("chrom", "chromStart", "chromEnd")) %>%
+            mutate(length = chromEnd-chromStart)
+
+ggplot(bed, aes(x = length)) +
+    geom_histogram(binwidth = 50, color = "black", fill = "darkorange") +
+    geom_vline(xintercept = 300, color = "darkred", linetype = "dashed") +
+    labs(x = "interval length", y = " ") +
+    theme_standard
+
+kable(
+    bed %>%
+        count(length > 500) %>%
+        filter(`length > 500` == TRUE),
+    caption = "Table 1b: Number of mapping fragments with length > 500bp"
+    )
+
+kable(
+    bed %>%
+        count(length > 25) %>%
+        filter(`length > 25` == TRUE),
+    caption = "Table 1c: Number of mapping fragments with length > 25bp"
+    )
+
+tmp <- bed %>%
+    filter(length > 25) %>%
+    rownames_to_column("Number") %>%
+    mutate(contig = glue("Contig_{Number}")) %>%
+    select(chrom, chromStart, chromEnd, contig)
+
+write_delim(tmp, "data/REF/CHRIST2018/map_intervals.bed", delim = "\t", col_names = FALSE)
+
+```
+
+Retain mapping intervals between 25 and 500 bp length; name contigs as `Contig_1` ... `r glue("Contig_{nrow(tmp)}")`.
+
+
+## Extract contigs with reads mapped & map reads
+
+For downstream applications like haplotyping it is necessary to have individual contigs that reads have mapped to and SNPs have been called on as opposed to the entire genome (with contiguous scaffolds per chromosome). Extracting "loci" (contigs) that are relevant needs to occur at this stage; this will also increase computational efficiency during mapping/SNP calling. Use identified mapping intervals to create a `reference.fasta` file that contains sequences equivalent to the intervals that have reads mapped to them.
+
+```{bash eval=FALSE, echo=TRUE}
+
+# extract intervals with SNPs
+module purge
+module load GCCcore/6.4.0
+module load BEDTools/2.27.1
+
+# extract intervals in filtered bed file
+bedtools getfasta -name -fi data/REF/CHRIST2018/Otsh_v1.0.fasta -bed data/REF/CHRIST2018/map_intervals.bed -fo data/REF/CHRIST2018/reference.fasta
+
+```
+
+Copy new `reference.fasta` into each sequencing folder and map all the `fastq`-files.
+
+```{bash eval=FALSE, echo=TRUE}
+
+# loop over sequencing files
+for i in $HOME/CHINOOK/data/SEQ/BMAG*; do
+
+    echo mapping $i ... `date`
+
+    cd $i
+
+        rm cat-RRG.bam*
+        rm reference.fasta*
+        rm namelist
+        rm dDocent.runs
+        rm bamlist.list
+        rm -r logfiles
+        rm mapped.bed
+
+    ## PREP FILES ----
+
+    # copy of configuration file
+    cp $HOME/CHINOOK/scr/map.config .
+
+    # copy of reference and associated files
+    cp $HOME/CHINOOK/data/REF/CHRIST2018/reference.* .
+
+    ## RUN dDOCENT ----
+
+    # make sure path correct to find conda
+    export PATH=$PATH:$HOME/miniconda3/bin
+
+    # open bioconda environment
+    source activate $HOME/miniconda3/envs/ddocent_env
+
+        # run dDocent to quality trim & map reads to reference genome
+        dDocent map.config
+
+    # close bioconda environment
+    source deactivate
+
+    rm $i/cat-RRG.bam*
+
+done
+
+```
+
+
+## QA/QC read mapping
+
+**Query reads counts and mapping quality**
+
+During the mapping stage, `dDocent` calls `BWA` to map reads from the individuals in the folder to reference and create a `-RG.bam`-file (retaining only unambiuously mapped reads) and `-RG.bam.bai` (index file) for each individual. The second column of a BAM file contains FLAGs with binary encoded information on mapping quality, pairedness etc. that can be used to compare the mapping efficiency to the reduced representation reference.
+
+Determine the number of reads in each `fastq` file (trimmed/untrimmed) and the number of mapped reads in the corresponding bam files, then filter reads with mapping quality < 5. Determine the coverage for mapping intervals for the un/trimmed `*.bam`-files.
+
+```{bash eval=FALSE, echo=TRUE}
+
+# navigate to project directory
+cd $HOME/CHINOOK
+
+# create results file
+echo "SAMPLE TOTAL_UNTRIMMED TOTAL_TRIMMED MAPPED MAPQ5 MAPQ10 MAPQ60" > $HOME/CHINOOK/results/BMAG_mapping.comp
+
+for d in data/SEQ/BMAG*; do
+
+    # navigate to directory
+    cd $d
+
+    # keep track of directory being processed
+    echo $d -----
+
+    # loop over bam files in directory
+    while read i; do
+
+        # keep track of file being processed
+        echo $i
+
+        # MAPPING QUALITY STATS ----
+
+        # load modules
+        module purge
+        module load GCC/6.4.0-2.28 OpenMPI/2.1.2
+        module load SAMtools/1.9
+
+        # untrimmed reads
+        TOT_UNTR=$(zcat $i.F.fq.gz | echo $((`wc -l`/4)))
+
+        # trimmed reads
+        TOT_TRIM=$(zcat $i.R1.fq.gz | echo $((`wc -l`/4)))
+
+        # mapped reads
+        MAP=$(samtools view $i-RG.bam -F 4 -c)
+
+        # reads with MAPQ>5
+        MAPQ5=$(samtools view $i-RG.bam -q 5 -c)
+
+        # reads with MAPQ>10
+        MAPQ10=$(samtools view $i-RG.bam -q 10 -c)
+
+        # reads with MAPQ=60
+        MAPQ60=$(samtools view $i-RG.bam -q 60 -c)
+
+        # add to file
+        echo "$i $TOT_UNTR $TOT_TRIM $MAP $MAPQ5 $MAPQ10 $MAPQ60" >> $HOME/CHINOOK/results/BMAG_mapping.comp
+
+        # filter to remove reads with MAPQ < 5
+        samtools view -bSq 5 $i-RG.bam > $HOME/CHINOOK/data/SNP_CALLING/$i.-RG.bam
+
+    # dDocent creates file with sample ids
+    done < namelist
+
+    # return to project directory
+    cd $HOME/CHINOOK/
+
+done
+
+```
+
+**Assess proportion of reads mapped per individual**
+
+```{r fig.cap="Fig 2: Distribution of proportion of reads in fastq file mapped per individual (grouped by library). Red dashed line indicates mean proportion of reads mapped overall.", fig.height=25, fig.width=5}
+
+counts <- read_delim("results/libraries_mapping_199.comp", delim = " ") %>%
+  filter(!is.na(MAPPED)) %>%
+    mutate(UNMAPPED = TOTAL_TRIMMED-MAPPED,
+           PERC_FILTERED = 100-round((TOTAL_TRIMMED/TOTAL_UNTRIMMED)*100, digits = 2),
+           PERC_MAPPED = round((MAPPED/TOTAL_TRIMMED)*100, digits = 2),
+           PERC_MAPQ60 = round(((MAPPED-MAPQ60)/TOTAL_TRIMMED)*100, digits = 2),
+           `PERC_MAPQ<10` = round(((MAPPED-MAPQ10)/TOTAL_TRIMMED)*100, digits = 2),
+           `PERC_MAPQ<05` = round(((MAPPED-MAPQ5)/TOTAL_TRIMMED)*100, digits = 2)) %>%
+  separate(SAMPLE, into = c("SP", "LIB", "SAMPLE_ID"), remove = FALSE, extra = "merge")
+
+ggplot(counts, aes(x = TOTAL_TRIMMED/1000000, y = PERC_MAPPED)) +
+  geom_point(shape = 21, size = 2, color = "black") +
+  geom_hline(aes(yintercept = mean(PERC_MAPPED)),
+             color = "darkred", linetype = "dashed") +
+  facet_grid(LIB ~ .) +
+  labs(x = "Million reads (trimmed)",
+       y = glue("% mapped (mean={round(mean(counts$PERC_MAPPED), digits = 2)})")) +
+  theme_facet
+
+```
+
+After quality trimming, individuals (N = `r nrow(counts)`) have a mean number of `r round(mean(counts$TOTAL_TRIMMED), digits = 0)` +/- `r round(sd(counts$TOTAL_TRIMMED), digits = 0)` (min = `r round(min(counts$TOTAL_TRIMMED), digits = 0)`, max = `r round(max(counts$TOTAL_TRIMMED), digits =0)`) quality trimmed sequenced reads. On average, `r round(mean(counts$PERC_MAPPED), digits = 0)` +/- `r round(sd(counts$PERC_MAPPED), digits = 0)` % of reads are mapped to the genome.
+
+**Assess mapping quality**
+
+```{r fig.cap="Fig 3: Distribution of proportion of reads quality trimmed, and proportion of quality trimmed reads mapped per individual overall and for varying threshold values of mapping quality. MAPQ ranges from 1 (ambiguously mapped) to 60; dDocent removes unmapped/ambiguously mapped reads from bam files.", fig.height=9, fig.width=25}
+
+counts %>%
+  gather(key = MAPQ_BINS, value = PERC_FILT, 12:16) %>%
+  mutate(MAPQ_BINS = str_sub(MAPQ_BINS, start = 6)) %>%
+  ggplot(aes(x = PERC_FILT)) +
+    geom_histogram(color = "black", fill = "darkorange") +
+    facet_grid(LIB ~ MAPQ_BINS, scales = "free") +
+    labs(x = "mapq < x filtered", y = "% reads filtered") +
+    theme_facet +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+
+# SNP calling
+
+Transfer copy of reference genome as `reference.fasta` along with symlinks for all `fq` and `bam`-files into the `SNP_Calling` folder to call variants across all individuals using `freebayes` [@Garrison2012]. `freebayes` is a bayesian haplotype-based variant detecter and calls variants based on alignments, i.e. based on the sequence of (short) reads aligned to a reference to determine the most-likely combination of genotypes for a set of individuals at each postion in the alignment to a reference.
+
+```{bash eval=FALSE, include=TRUE}
+
+# copy of reference genome
+cp data/REF/CHRIST2018/reference.* data/SNP_CALLING/
+
+# copy of mapping/SNP Calling configuration
+cp scr/callSNPs.config data/SNP_CALLING/
+
+# softlink fastq files
+for d in data/SEQ/BMAG*; do
+
+  cd data/SNP_CALLING/
+
+  cp -s ../../$d/*.fq.gz .
+
+  cp -s ../../YUBA/*.fq.gz .
+
+  cd ../../
+
+done
+
+```
+
+Execute `dDocent` from within `SNP_Calling`-folder to call variants across all individuals - need to submit `SLURM`-script to run on MSU's `hpcc`.
+
+```{bash eval=FALSE, include=TRUE}
+
+# navigate to starting directory
+cd $HOME/CHINOOK/data/SNP_CALLING/
+
+
+# open bioconda environment
+source activate $HOME/bin/miniconda3/envs/ddocent_env
+
+    # run dDocent to quality trim & map reads to reference genome
+    dDocent callSNPs.config
+
+# close bioconda environment
+source deactivate
+
+# navigate to project folder
+cd $HOME/CHINOOK/
+
+```
+
+File `TotalrawSNPs.vcf` contains all raw SNP/INDEL calls. Do not need to keep links of `fq.gz`-, `bam`-, `.bam.bai`-files after SNPs have been called. Copy `TotalRaSNPs.vcf` to `VCF`-directory for SNP filtering.
+
+```{bash eval=FALSE, include=FALSE}
+
+# remove unnecessary intermediate files
+rm data/SNP_CALLING/*fq.gz
+rm data/SNP_CALLING/rm *bam*
+rm data/SNP_CALLING/*.cov.stats
+rm data/SNP_CALLING/Final.recode.vcf
+rm data/SNP_CALLING/dDocent*
+rm -r data/SNP_CALLING/logfiles
+rm -r data/SNP_CALLING/raw.vcf
+
+```
+
+
+# SNP filtering
+
+## Raw data
+
+**Assess individuals & populations sampled**
+
+Generate a list of all individuals included in the VCF-file to be filtered.
+
+```{bash eval=FALSE, include=TRUE}
+
+# Need to make sure `vcflib` is installed
+# git clone --recursive https://github.com/vcflib/vcflib.git
+# cd scr/vcflib
+# make -j
+
+# load modules for vcf filtering
+module purge
+module load GCC/6.4.0-2.28  OpenMPI/2.1.2
+module load VCFtools/0.1.15-Perl-5.26.1
+
+scr/vcflib/bin/vcfsamplenames data/SNP_CALLING/TotalRawSNPs.vcf > data/VCF/raw.ind
+
+```
+
+Use `raw.ind` file to write text files of individuals in each library and grouped by runs/locations.
+
+```{r}
+
+## FORMAT SAMPLE NAMES & INFORMATION ====
+
+# import individuals in raw data set ----
+Ind_RAW <- read_delim("data/VCF/raw.ind",
+                      delim = "\t", col_names = "LIB_ID") %>%
+  separate(LIB_ID, into = c("SP", "LIB", "SAMPLE_ID"),
+           sep = "_", remove = FALSE, extra = "merge") %>%
+  separate(SAMPLE_ID, into = c("RUN", "YEAR", "INDV", "LOCATION"),
+           sep = c(1, 3, 7), remove = FALSE) %>%
+  mutate(LOCATION = ifelse(LOCATION %in% c("7FRH", "8FRH"), "FRH", LOCATION))
+
+# some samples from MRH (Merced R Fish Hatchery) have different format
+MRH <- Ind_RAW %>%
+  filter(grepl("FEM", LIB_ID) | grepl("Male", LIB_ID)) %>%
+  select(LIB_ID, SP, LIB, SAMPLE_ID) %>%
+  mutate(RUN = "F",
+         YEAR = NA,
+         INDV = NA,
+         LOCATION = "MRH")
+
+# add df back together
+Ind_RAW <- Ind_RAW %>%
+  filter(!SAMPLE_ID %in% MRH$SAMPLE_ID) %>%
+  bind_rows(MRH) %>%
+  filter(!grepl("CHIN", LIB_ID))
+
+rm(MRH)
+
+## CREATE FILES W/INDV BY RUN ====
+
+pops <- unique(Ind_RAW$RUN)
+
+for (p in pops){
+
+  df <- Ind_RAW %>%
+    filter(RUN == p) %>%
+    select(LIB_ID)
+
+  write_delim(df, paste("data/VCF/", p, ".ind", sep = ""),
+            delim = "", col_names = FALSE)
+
+}
+
+# print table with sample sizes per run/location
+kable(
+  Ind_RAW %>%
+    group_by(RUN, LOCATION) %>%
+    count() %>%
+    ungroup() %>%
+    spread(key = RUN, value = n),
+  caption = "Table 2a: Number of samples per location and run type."
+)
+
+# CREATE FILES W/INDV PER LIB ====
+
+# still missing info for some libraries ...
+libs <- unique(Ind_RAW$LIB)
+
+for (l in libs){
+
+  df <- Ind_RAW %>%
+    filter(LIB == l) %>%
+    select(LIB_ID)
+
+  write_delim(df, paste("data/VCF/", l, ".ind", sep = ""),
+            delim = "", col_names = FALSE)
+
+}
+
+# print table with number of sequences per library
+kable(
+  Ind_RAW %>%
+    group_by(LIB) %>%
+    count() %>%
+    ungroup() %>%
+    arrange(LIB),
+  caption = "Table 2b: Number of samples library."
+)
+
+```
+
+
+**Compare Individual & SNP stats**
+
+Use `VCFtools` to create stats files for depth, missing data, heterozygosity, and site quality for the raw data.
+
+```{bash eval=FALSE, echo=TRUE}
+
+vcftools --vcf data/SNP_CALLING/TotalRawSNPs.vcf --out data/VCF/ONC_raw --depth
+vcftools --vcf data/SNP_CALLING/TotalRawSNPs.vcf --out data/VCF/ONC_raw --site-mean-depth
+vcftools --vcf data/SNP_CALLING/TotalRawSNPs.vcf --out data/VCF/ONC_raw --site-quality
+vcftools --vcf data/SNP_CALLING/TotalRawSNPs.vcf --out data/VCF/ONC_raw --missing-indv
+vcftools --vcf data/SNP_CALLING/TotalRawSNPs.vcf --out data/VCF/ONC_raw --missing-site
+vcftools --vcf data/SNP_CALLING/TotalRawSNPs.vcf --out data/VCF/ONC_raw --het
+
+```
+
+Compare patterns of missing data, read depth, and quality of SNP calls across individuals and loci.
+
+```{r fig.cap="Fig 4: Distribution and relationships of missing data, read depth, and SNP quality across loci and individuals.", fig.height=20, fig.width=10}
+
+# load stats files ----
+ind_stats_raw <- read.ind.stats(dir = "data/VCF", vcf = "ONC_raw") %>%
+  separate(INDV, into = c("SP", "LIB", "SAMPLE_ID"), sep = "_", remove = FALSE)
+
+loc_stats_raw <- read.loc.stats(dir = "data/VCF/", vcf = "ONC_raw")
+
+# plot missing data per indv ----
+p1 <- ggplot(ind_stats_raw, aes(x = MISS_ONC_raw)) +
+  geom_histogram(binwidth = .01, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(MISS_ONC_raw, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 0.5),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "missing data per indv") +
+  theme_standard
+
+# plot read depth per indv ----
+p2 <- ggplot(ind_stats_raw, aes(x = MEAN_DEPTH_ONC_raw)) +
+  geom_histogram(binwidth = 10, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(MEAN_DEPTH_ONC_raw, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 20),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "mean read depth per indv") +
+  theme_standard
+
+# plot depth vs missing ----
+p3 <- ggplot(ind_stats_raw, aes(x = MEAN_DEPTH_ONC_raw, y = MISS_ONC_raw)) +
+  geom_point() +
+  geom_vline(aes(xintercept = mean(MEAN_DEPTH_ONC_raw, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 20),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = mean(MISS_ONC_raw, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 0.5),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "mean depth per indv", y = "% missing data") +
+  theme_standard
+
+# plot Fis per indv ----
+p4 <- ggplot(ind_stats_raw, aes(x = Fis_ONC_raw)) +
+  geom_histogram(binwidth = .01, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(Fis_ONC_raw, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 0),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "Fis per indv") +
+  theme_standard
+
+# plot Fis vs missing data per indv ----
+p5 <- ggplot(ind_stats_raw, aes(x = Fis_ONC_raw, y = MISS_ONC_raw)) +
+  geom_point() +
+  geom_vline(aes(xintercept = mean(Fis_ONC_raw, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 0),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = mean(MISS_ONC_raw, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 0.5),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "Fis per indv", y = "% missing data") +
+  theme_standard
+
+# plot Fis vs mean depth per indv ----
+p6 <- ggplot(ind_stats_raw, aes(x = Fis_ONC_raw, y = MEAN_DEPTH_ONC_raw)) +
+  geom_point() +
+  geom_vline(aes(xintercept = mean(Fis_ONC_raw, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 0),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = mean(MEAN_DEPTH_ONC_raw, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 20),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "Fis per indv", y = "mean depth per indv") +
+  theme_standard
+
+# plot distribution missing data per locus ----
+p7 <- ggplot(loc_stats_raw, aes(x = MISS_ONC_raw)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(MISS_ONC_raw, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 0.1),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "% missing data per locus") +
+  theme_standard
+
+# plot distribution mean read depth ----
+p8 <- ggplot(loc_stats_raw, aes(x = MEAN_DEPTH_ONC_raw)) +
+  geom_histogram(binwidth = 20, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(MEAN_DEPTH_ONC_raw, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 20),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "mean read depth per locus") +
+  theme_standard
+
+# plot read depth vs missing data ----
+p9 <- ggplot(loc_stats_raw, aes(x = MEAN_DEPTH_ONC_raw, y = MISS_ONC_raw)) +
+  geom_point() +
+  geom_vline(aes(xintercept = mean(MEAN_DEPTH_ONC_raw, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 20),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = mean(MISS_ONC_raw, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 0.1),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "mean depth per locus", y = "% missing data") +
+  theme_standard
+
+# plot depth vs SNP quality ----
+site_qual <- read.table("data/VCF/ONC_raw.lqual",
+                        header = TRUE, stringsAsFactors = FALSE) %>%
+  mutate(PROB = 10^(-QUAL/10))
+
+temp <- data.frame(loc_stats_raw$MEAN_DEPTH_ONC_raw, site_qual$QUAL) %>%
+  rename(depth = loc_stats_raw.MEAN_DEPTH_ONC_raw, qual = site_qual.QUAL)
+
+p10 <- ggplot(temp, aes(x = depth, y = qual)) +
+  geom_point(size = 1) +
+  geom_vline(aes(xintercept = mean(depth, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 20),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = mean(qual, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 20),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "mean depth per locus", y = "SNP quality") +
+  theme_standard
+
+# plot number of SNPs per contig vs. mean depth ----
+temp <- loc_stats_raw %>%
+  count(CHR)
+
+p11 <- left_join(temp, loc_stats_raw) %>%
+  ggplot() +
+  geom_point(aes(x = n, y = MEAN_DEPTH_ONC_raw)) +
+  labs(x = "number of SNPs per contig", y = "mean depth") +
+  theme_standard
+
+# plot no of SNPs per locus ----
+p12 <- loc_stats_raw %>%
+  count(CHR) %>%
+  ggplot(aes(x = n)) +
+  geom_histogram(binwidth = 1, color = "black", fill = "darkorange") +
+  labs(x = "number of SNPs per locus") +
+  theme_standard
+
+ multiplot(p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, cols=2)
+
+```
+
+The raw data set contains `r nrow(ind_stats_raw)` individuals and `r nrow(loc_stats_raw)` loci.
+
+
+## Choose threshold values for quality score, coverage, missing data, and mapping/variant calling artifacts
+
+**FILTER 0: Decompose indels to retain only SNPs**
+
+Identify low quality individuals to remove from the data set; defined as individuals with a mean coverage of < 3 reads across all loci, > 75% missing data (thresholds based on initial exploratory filtering to maximize number of indv/loci retained in data set). In addition, remove all individuals from library BMAG002, BMAG008, and BMAG009 due to a library effect.
+
+```{r}
+
+LQindv <- ind_stats_raw %>%
+  filter(MISS_ONC_raw > .75 | LIB %in% c("BMAG002", "BMAG008", "BMAG009")) %>%
+  select(INDV)
+
+write_delim(LQindv, "data/VCF/LQ_F0.ind", delim = "\t")
+
+```
+
+A total of `r nrow(LQindv)` were flagged as low quality based on missing data, depth, or heterozygosity.
+
+Remove LQ individuals, decompose indels, and retain only biallelic SNPs.
+
+```{bash eval=FALSE, include=TRUE}
+
+# decompose indels
+scr/vcflib/bin/vcfallelicprimitives data/SNP_CALLING/TotalRawSNPs.vcf --keep-info --keep-geno > data/VCF/temp/ONC.prim.vcf
+
+# retain only SNPs
+vcftools --vcf data/VCF/temp/ONC.prim.vcf --out data/VCF/temp/ONC.F0 --remove data/VCF/LQ_F0.ind --remove-indels --min-alleles 2 --max-alleles 2 --recode --recode-INFO-all
+
+# query stats
+vcftools --vcf data/VCF/temp/ONC.F0.recode.vcf --out data/VCF/ONC.F0 --depth
+vcftools --vcf data/VCF/temp/ONC.F0.recode.vcf --out data/VCF/ONC.F0 --site-mean-depth
+vcftools --vcf data/VCF/temp/ONC.F0.recode.vcf --out data/VCF/ONC.F0 --missing-indv
+vcftools --vcf data/VCF/temp/ONC.F0.recode.vcf --out data/VCF/ONC.F0 --missing-site
+vcftools --vcf data/VCF/temp/ONC.F0.recode.vcf --out data/VCF/ONC.F0 --het
+
+```
+
+Compare data set -
+
+```{r}
+
+# load stats files ----
+ind_stats_F0 <- read.ind.stats(dir = "data/VCF", vcf = "ONC.F0") %>%
+  separate(INDV, into = c("SP", "LIB", "SAMPLE_ID"),
+           sep = "_", remove = FALSE, extra = "merge")
+
+loc_stats_F0 <- read.loc.stats(dir = "data/VCF/", vcf = "ONC.F0")
+
+```
+
+Data set contains `r nrow(ind_stats_F0)` individuals and `r nrow(loc_stats_F0)` loci after removing low quality individuals and decomposing indels set into SNPs.
+
+
+**FILTER 1: Confidence in SNP call**
+
+The QUAL column of a VCF file is a phred-based score indicating the probability that the variant shown in the ALT column is wrong. Given the Phred quality score (Q), and the probability that a base is incorrectly called (P), Q = -10(Log10P). A quality score of 20 indicates, a 1 in 100 chance that the SNP site has been called incorrectly (i.e. 99% probability that correct call).
+
+Code genotypes with genotype call quality < 20 or genotype depth < 5 as missing and remove loci with quality < 20, mean depth < 10 and/or > 50% missing data.
+
+```{bash eval=FALSE, include=TRUE}
+
+# filter LQ SNP calls
+vcftools --vcf data/VCF/temp/ONC.F0.recode.vcf --out data/VCF/temp/ONC.F1a --minQ 20 --minGQ 20 --minDP 5 --max-missing 0.5 --recode --recode-INFO-all
+
+# query stats
+vcftools --vcf data/VCF/temp/ONC.F1a.recode.vcf --out data/VCF/ONC.F1a --singletons
+vcftools --vcf data/VCF/temp/ONC.F1a.recode.vcf --out data/VCF/ONC.F1a --geno-depth
+
+```
+
+Import singletons and genotype depth file to create list of loci to exclude based on depth.
+
+```{r fig.cap="Fig 5: Distribution of number of singletons per contig.", fig.height=3, fig.width=4}
+
+# number of individuals
+n <- nrow(ind_stats_F0)+2
+
+# read singletons file
+singletons <- read_table2("data/VCF/ONC.F1a.singletons") %>%
+  mutate(VARIANT = ifelse(ALLELE %in% c("A", "T", "C", "G"), "SNP", "INDEL"))
+
+chrom <- unique(singletons$CHROM)
+
+# read genotype depth file and join with singletons
+gdepth <- read_table2("data/VCF/ONC.F1a.gdepth") %>%
+  filter(CHROM %in% chrom) %>%
+  gather(key = INDV, value = DEPTH, 3:n)
+
+singletons <- left_join(singletons, gdepth)
+
+# number of doubletons
+doubletons <- singletons %>%
+  filter(`SINGLETON/DOUBLETON` == "D")
+
+# number of contigs in data set
+contigs_total <- loc_stats_F0 %>%
+    distinct(CHR)
+
+contigs_singletons <- singletons %>%
+    distinct(CHROM)
+
+contigs <- singletons %>%
+    count(CHROM)
+
+ggplot(contigs, aes(x = n)) +
+    geom_histogram(binwidth = 1, color = "black", fill = "darkorange") +
+    geom_vline(aes(xintercept = mean(n, na.rm = TRUE)),
+               color = "darkblue", linetype = "dashed", size = 1) +
+    labs(x = "number of singletons per locus") +
+    theme_standard
+
+```
+
+Data set contains `nrow(singletons)` singletons of those `nrow(doubletons)` are called as a homozygote in one individual (doubletons). Overall, there are `nrow(contigs_total)` remaining contigs, `nrow(contigs_singletons)` (`r round( (nrow(contigs_singletons)/nrow(contigs_total)*100), digits = 2)`%) contain singletons.
+
+```{r fig.cap="Fig 6: Distribution of the number of singletons per individual", fig.height=3, fig.width=6}
+
+Ind <- singletons %>%
+  group_by(`SINGLETON/DOUBLETON`) %>%
+  count(INDV) %>%
+  left_join(ind_stats_F0)
+
+ggplot(Ind, aes(x = n)) +
+  geom_histogram(binwidth = 50, color = "black", fill = "darkorange") +
+  facet_grid(. ~ `SINGLETON/DOUBLETON`) +
+  labs(x = "number of singletons per indv") +
+  theme_standard
+
+```
+
+Compare the genotype depth to ensure that there is sufficient depth to recover both alleles (i.e. are doubletons true homozygotes) and ensure quality of singleton gentoypes.
+
+```{r fig.cap="Fig 7: Distribution genotype depth per singleton/doubleton.", fig.height=7, fig.width=5}
+
+ggplot(singletons, aes(x = DEPTH)) +
+  geom_histogram(binwidth = 20, color = "black", fill = "darkorange") +
+  facet_grid(`SINGLETON/DOUBLETON` ~ ., scales = "free") +
+  labs(x = "read depth") +
+  scale_y_sqrt() +
+  theme_standard
+
+quantile(singletons$DEPTH, probs = c(.05, .25, .5, .75, .95, .99))
+
+```
+
+Identify low quality singletons (potential artifacts resulting from PCR or sequencing error) by flagging singletons with depth < 10 reads and doubletons with depth < 20 reads.
+
+```{r}
+
+# < 10 reads
+kable(
+    singletons %>%
+        group_by(`SINGLETON/DOUBLETON`) %>%
+        count(DEPTH <= 10) %>%
+        filter(`DEPTH <= 10` == TRUE) %>%
+        select(-`DEPTH <= 10`),
+    caption = "Table 3a: Number of singletons/doubletons with depth < 10 reads.")
+
+# < 20 reads
+kable(
+    singletons %>%
+        group_by(`SINGLETON/DOUBLETON`) %>%
+        count(DEPTH <= 20) %>%
+        filter(`DEPTH <= 20` == TRUE) %>%
+        select(-`DEPTH <= 20`),
+    caption = "Table 3b: Number of singletons/doubletons with depth < 20 reads.")
+
+d <- singletons %>%
+  filter(`SINGLETON/DOUBLETON` == "D" & DEPTH <= 20)
+
+LQ <- singletons %>%
+  filter(DEPTH <= 10) %>%
+  bind_rows(d) %>%
+  select(CHROM, POS)
+
+write_delim(LQ, "data/VCF/LQ_F0.loci", delim = "\t", col_names = FALSE)
+
+```
+
+Filter loci with quality score < 20 and singletons/doubletons with low read depth (<10/20 reads).
+
+```{bash eval=FALSE, echo=TRUE}
+
+# filter LQ SNP calls
+vcftools --vcf data/VCF/temp/ONC.F1a.recode.vcf --out data/VCF/temp/ONC.F1 --exclude-positions data/VCF/LQ_F0.loci --recode --recode-INFO-all
+
+# query stats
+vcftools --vcf data/VCF/temp/ONC.F1.recode.vcf --out data/VCF/ONC.F1 --depth
+vcftools --vcf data/VCF/temp/ONC.F1.recode.vcf --out data/VCF/ONC.F1 --site-mean-depth
+vcftools --vcf data/VCF/temp/ONC.F1.recode.vcf --out data/VCF/ONC.F1 --missing-indv
+vcftools --vcf data/VCF/temp/ONC.F1.recode.vcf --out data/VCF/ONC.F1 --missing-site
+vcftools --vcf data/VCF/temp/ONC.F1.recode.vcf --out data/VCF/ONC.F1 --het
+
+```
+
+Compare stats post-filtering.
+
+```{r}
+
+# load stats files ----
+ind_stats_F1 <- read.ind.stats(dir = "data/VCF", vcf = "ONC.F1") %>%
+  separate(INDV, into = c("SP", "LIB", "SAMPLE_ID"),
+           sep = "_", remove = FALSE, extra = "merge")
+
+loc_stats_F1 <- read.loc.stats(dir = "data/VCF/", vcf = "ONC.F1")
+
+```
+
+Data set contains `r nrow(ind_stats_F1)` individuals and `r nrow(loc_stats_F1)` SNP sites.
+
+
+**FILTER 2: Genotype call rate and allowed missing data per indv**
+
+```{bash eval=FALSE, include=TRUE}
+
+# Fall
+vcftools --vcf data/VCF/temp/ONC.F1.recode.vcf --out data/VCF/temp/FALL --keep data/VCF/F.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/FALL.recode.vcf --out data/VCF/FALL --missing-site
+
+# Late Fall
+vcftools --vcf data/VCF/temp/ONC.F1.recode.vcf --out data/VCF/temp/LATE-FALL --keep data/VCF/L.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/LATE-FALL.recode.vcf --out data/VCF/LATE-FALL --missing-site
+
+# Spring
+vcftools --vcf data/VCF/temp/ONC.F1.recode.vcf --out data/VCF/temp/SPRING --keep data/VCF/S.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/SPRING.recode.vcf --out data/VCF/SPRING --missing-site
+
+# Winter
+vcftools --vcf data/VCF/temp/ONC.F1.recode.vcf --out data/VCF/temp/WINTER --keep data/VCF/W.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/WINTER.recode.vcf --out data/VCF/WINTER --missing-site
+
+
+# output missing data per library ----------------------------------------
+
+# library BMAG002
+vcftools --vcf data/VCF/temp/ONC.F1.recode.vcf --out data/VCF/temp/BMAG002 --keep data/VCF/BMAG002.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG002.recode.vcf --out data/VCF/BMAG002 --missing-site
+
+# library BMAG006
+vcftools --vcf data/VCF/temp/ONC.F1.recode.vcf --out data/VCF/temp/BMAG006 --keep data/VCF/BMAG006.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG006.recode.vcf --out data/VCF/BMAG006 --missing-site
+
+# library BMAG007
+vcftools --vcf data/VCF/temp/ONC.F1.recode.vcf --out data/VCF/temp/BMAG007 --keep data/VCF/BMAG007.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG007.recode.vcf --out data/VCF/BMAG007 --missing-site
+
+# library BMAG020
+vcftools --vcf data/VCF/temp/ONC.F1.recode.vcf --out data/VCF/temp/BMAG020 --keep data/VCF/BMAG020.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG020.recode.vcf --out data/VCF/BMAG020 --missing-site
+
+# library BMAG021
+vcftools --vcf data/VCF/temp/ONC.F1.recode.vcf --out data/VCF/temp/BMAG021 --keep data/VCF/BMAG021.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG021.recode.vcf --out data/VCF/BMAG021 --missing-site
+
+# library BMAG022
+vcftools --vcf data/VCF/temp/ONC.F1.recode.vcf --out data/VCF/temp/BMAG022 --keep data/VCF/BMAG022.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG022.recode.vcf --out data/VCF/BMAG022 --missing-site
+
+# library BMAG023
+vcftools --vcf data/VCF/temp/ONC.F1.recode.vcf --out data/VCF/temp/BMAG023 --keep data/VCF/BMAG023.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG023.recode.vcf --out data/VCF/BMAG023 --missing-site
+
+# library BMAG024
+vcftools --vcf data/VCF/temp/ONC.F1.recode.vcf --out data/VCF/temp/BMAG024 --keep data/VCF/BMAG024.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG024.recode.vcf --out data/VCF/BMAG024 --missing-site
+
+# BMAG025rary BMAG025
+vcftools --vcf data/VCF/temp/ONC.F1.recode.vcf --out data/VCF/temp/BMAG025 --keep data/VCF/BMAG025.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG025.recode.vcf --out data/VCF/BMAG025 --missing-site
+
+# library BMAG001
+vcftools --vcf data/VCF/temp/ONC.F1.recode.vcf --out data/VCF/temp/BMAG001 --keep data/VCF/BMAG001.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG001.recode.vcf --out data/VCF/BMAG001 --missing-site
+
+# library BMAG008
+vcftools --vcf data/VCF/temp/ONC.F1.recode.vcf --out data/VCF/temp/BMAG008 --keep data/VCF/BMAG008.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG008.recode.vcf --out data/VCF/BMAG008 --missing-site
+
+# library BMAG010
+vcftools --vcf data/VCF/temp/ONC.F1.recode.vcf --out data/VCF/temp/BMAG010 --keep data/VCF/BMAG010.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG010.recode.vcf --out data/VCF/BMAG010 --missing-site
+
+# library BMAG013
+vcftools --vcf data/VCF/temp/ONC.F1.recode.vcf --out data/VCF/temp/BMAG013 --keep data/VCF/BMAG013.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG013.recode.vcf --out data/VCF/BMAG013 --missing-site
+
+# library BMAG009
+vcftools --vcf data/VCF/temp/ONC.F1.recode.vcf --out data/VCF/temp/BMAG009 --keep data/VCF/BMAG009.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG009.recode.vcf --out data/VCF/BMAG009 --missing-site
+
+# library BMAG017
+vcftools --vcf data/VCF/temp/ONC.F1.recode.vcf --out data/VCF/temp/BMAG017 --keep data/VCF/BMAG017.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG017.recode.vcf --out data/VCF/BMAG017 --missing-site
+
+```
+
+Flag loci that were not called in > 50% of individuals in a given library.
+
+```{r fig.cap="Fig 8: Distribution of missing data per locus for individuals grouped by library", fig.height=10, fig.width=10}
+
+libs <- libs[!libs %in% c("BMAG002", "BMAG008", "BMAG009")]
+
+# create empty list
+loc_missing <- list()
+
+for (l in libs) {
+
+  loc_missing[[l]] <- read_delim(paste("data/VCF/", l, ".lmiss", sep = ""),
+                                 delim = "\t") %>%
+    select(CHR, POS, F_MISS)
+
+}
+
+# create data frame with all information
+loc_missing <- ldply(loc_missing, data.frame) %>%
+  rename(LIB = `.id`)
+
+ggplot(loc_missing, aes(x = F_MISS)) +
+  geom_histogram(binwidth = .1, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = 0.5),
+             color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "missing data per locus") +
+  facet_wrap(. ~ LIB) +
+  theme_standard
+
+# identify loci with high missing data in each library
+SNPs <- filter(loc_missing, F_MISS > 0.5) %>%
+  arrange(CHR, POS)
+
+kable(
+  count(SNPs, LIB),
+  format.args = list(big.mark = ","),
+  caption = "Table 4: Number of SNPs called in < 50% of individuals of a given library.")
+
+LQloci_lib <- SNPs %>%
+  distinct(CHR, POS)
+
+```
+
+A total of `r nrow(LQloci_lib)` loci were called in less than 50% of individuals in one or more libraries. Loci being inconsistently called among libraries can result in library effects.
+
+Flag loci that were not called in > 50% of individuals at a given run type (this will be checked again at the end of the filtering process).
+
+```{r fig.cap="Fig 9: Distribution of missing data per locus for individuals grouped by library.", fig.height=10, fig.width=4}
+
+# create empty list
+loc_missing <- list()
+
+# pops to loop over
+pop <- c("FALL", "LATE-FALL", "SPRING", "WINTER")
+
+# import missing data per locus
+for (p in pop) {
+
+  loc_missing[[p]] <- read_delim(paste("data/VCF/", p, ".lmiss", sep = ""),
+                                 delim = "\t") %>%
+    select(CHR, POS, F_MISS) %>%
+    mutate(POP = p)
+
+}
+
+# create data frame with all information
+loc_missing <- ldply(loc_missing, data.frame) %>%
+  select(-`.id`)
+
+ggplot(loc_missing, aes(x = F_MISS)) +
+  geom_histogram(binwidth = .05, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = 0.5),
+             color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "missing data per locus") +
+  facet_grid(POP ~ .) +
+  scale_y_sqrt() +
+  theme_standard
+
+
+# identify loci with high missing data for individuals grouped by run type
+SNPs <- filter(loc_missing, F_MISS > 0.5) %>%
+  arrange(CHR, POS)
+
+kable(
+  count(SNPs, POP),
+  format.args = list(big.mark = ","),
+  caption = "Table 5: Number of SNPs called in < 50% of individuals of a given run type."
+)
+
+LQloci_pop <- SNPs %>%
+  select(CHR, POS) %>%
+  unique()
+
+LQloci <- bind_rows(LQloci_lib, LQloci_pop) %>%
+  unique()
+
+# Write contig/position to file
+write.table(LQloci, file = "data/VCF/LQ_F2.loci",
+            col.names= FALSE, row.names = FALSE, quote = FALSE)
+
+```
+
+A total of `r nrow(LQloci_pop)` SNPs were called in less than 50% of individuals of a given run type.
+
+Remove loci that were not consistently called across all libraries and run types (`r nrow(LQloci)` SNPs).
+
+```{bash eval=FALSE, echo=TRUE}
+
+vcftools --vcf data/VCF/temp/ONC.F1.recode.vcf --out data/VCF/temp/ONC.F2a --exclude-positions data/VCF/LQ_F2.loci --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/ONC.F2a.recode.vcf --out data/VCF/ONC.F2a --missing-indv
+
+```
+
+Identify individuals with > 75% missing data
+
+```{r fig.cap="Fig 10: Missing data per individual.", fig.height=3, fig.width=4}
+
+# determine cutoff
+imiss <- read_delim("data/VCF/ONC.F2a.imiss", delim = "\t")
+
+ggplot(imiss, aes(x = F_MISS)) +
+  geom_histogram(binwidth = 0.05, color = "black", fill = "darkorange") +
+  geom_vline(xintercept = 0.75, color = "darkblue", linetype = "dashed", size = 1) +
+  theme_standard
+
+imiss <- imiss %>%
+  filter(F_MISS > 0.75) %>%
+  select(INDV)
+
+write.table(imiss, "data/VCF/F2_LQ.indv",
+            col.names = TRUE, row.names = FALSE, quote = FALSE)
+
+```
+
+Remove flagged individuals (N = `r nrow(imiss)`).
+
+```{bash eval=FALSE, echo=TRUE}
+
+vcftools --vcf data/VCF/temp/ONC.F2a.recode.vcf --out data/VCF/temp/ONC.F2 --remove data/VCF/F2_LQ.indv --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/ONC.F2.recode.vcf --out data/VCF/ONC.F2 --depth
+vcftools --vcf data/VCF/temp/ONC.F2.recode.vcf --out data/VCF/ONC.F2 --site-mean-depth
+vcftools --vcf data/VCF/temp/ONC.F2.recode.vcf --out data/VCF/ONC.F2 --missing-indv
+vcftools --vcf data/VCF/temp/ONC.F2.recode.vcf --out data/VCF/ONC.F2 --missing-site
+vcftools --vcf data/VCF/temp/ONC.F2.recode.vcf --out data/VCF/ONC.F2 --het
+
+```
+
+Compare data set post-filtering -
+
+```{r }
+
+# load stats files ----
+ind_stats_F2 <- read.ind.stats(dir = "data/VCF", vcf = "ONC.F2") %>%
+  separate(INDV, into = c("SP", "LIB", "SAMPLE_ID"), sep = "_", remove = FALSE)
+
+loc_stats_F2 <- read.loc.stats(dir = "data/VCF/", vcf = "ONC.F2")
+
+```
+
+Data set contains `r nrow(ind_stats_F2)` individuals and `r nrow(loc_stats_F2)` SNP loci.
+
+
+**FILTER 3: Filter loci and individuals based on depth, variance in depth, and genotype call rate**
+
+Determine mean depth and variance per locus per library.
+
+```{bash eval=FALSE, include=TRUE}
+
+# library BMAG002
+vcftools --vcf data/VCF/temp/ONC.F2a.recode.vcf --out data/VCF/temp/BMAG002 --keep data/VCF/BMAG002.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG002.recode.vcf --out data/VCF/BMAG002 --site-mean-depth
+
+# library BMAG006
+vcftools --vcf data/VCF/temp/ONC.F2a.recode.vcf --out data/VCF/temp/BMAG006 --keep data/VCF/BMAG006.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG006.recode.vcf --out data/VCF/BMAG006 --site-mean-depth
+
+# library BMAG007
+vcftools --vcf data/VCF/temp/ONC.F2a.recode.vcf --out data/VCF/temp/BMAG007 --keep data/VCF/BMAG007.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG007.recode.vcf --out data/VCF/BMAG007 --site-mean-depth
+
+# library BMAG020
+vcftools --vcf data/VCF/temp/ONC.F2a.recode.vcf --out data/VCF/temp/BMAG020 --keep data/VCF/BMAG020.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG020.recode.vcf --out data/VCF/BMAG020 --site-mean-depth
+
+# library BMAG021
+vcftools --vcf data/VCF/temp/ONC.F2a.recode.vcf --out data/VCF/temp/BMAG021 --keep data/VCF/BMAG021.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG021.recode.vcf --out data/VCF/BMAG021 --site-mean-depth
+
+# library BMAG022
+vcftools --vcf data/VCF/temp/ONC.F2a.recode.vcf --out data/VCF/temp/BMAG022 --keep data/VCF/BMAG022.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG022.recode.vcf --out data/VCF/BMAG022 --site-mean-depth
+
+# library BMAG023
+vcftools --vcf data/VCF/temp/ONC.F2a.recode.vcf --out data/VCF/temp/BMAG023 --keep data/VCF/BMAG023.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG023.recode.vcf --out data/VCF/BMAG023 --site-mean-depth
+
+# library BMAG024
+vcftools --vcf data/VCF/temp/ONC.F2a.recode.vcf --out data/VCF/temp/BMAG024 --keep data/VCF/BMAG024.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG024.recode.vcf --out data/VCF/BMAG024 --site-mean-depth
+
+# library BMAG025
+vcftools --vcf data/VCF/temp/ONC.F2a.recode.vcf --out data/VCF/temp/BMAG025 --keep data/VCF/BMAG025.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG025.recode.vcf --out data/VCF/BMAG025 --site-mean-depth
+
+# library BMAG001
+vcftools --vcf data/VCF/temp/ONC.F2a.recode.vcf --out data/VCF/temp/BMAG001 --keep data/VCF/BMAG001.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG001.recode.vcf --out data/VCF/BMAG001 --site-mean-depth
+
+# library BMAG008
+vcftools --vcf data/VCF/temp/ONC.F2a.recode.vcf --out data/VCF/temp/BMAG008 --keep data/VCF/BMAG008.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG008.recode.vcf --out data/VCF/BMAG008 --site-mean-depth
+
+# library BMAG010
+vcftools --vcf data/VCF/temp/ONC.F2a.recode.vcf --out data/VCF/temp/BMAG010 --keep data/VCF/BMAG010.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG010.recode.vcf --out data/VCF/BMAG010 --site-mean-depth
+
+# library BMAG013
+vcftools --vcf data/VCF/temp/ONC.F2a.recode.vcf --out data/VCF/temp/BMAG013 --keep data/VCF/BMAG013.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG013.recode.vcf --out data/VCF/BMAG013 --site-mean-depth
+
+# library BMAG009
+vcftools --vcf data/VCF/temp/ONC.F2a.recode.vcf --out data/VCF/temp/BMAG009 --keep data/VCF/BMAG009.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG009.recode.vcf --out data/VCF/BMAG009 --site-mean-depth
+
+# library BMAG017
+vcftools --vcf data/VCF/temp/ONC.F2a.recode.vcf --out data/VCF/temp/BMAG017 --keep data/VCF/BMAG017.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG017.recode.vcf --out data/VCF/BMAG017 --site-mean-depth
+
+```
+
+Compare distribution of depth coverage per locus per library. Identify loci that do not have consistent read depth among libraries (can lead to library effects), and/or across individuals.
+
+```{r fig.cap="Fig 11: Distribution of mean depth per locus per library", fig.height=5, fig.width=10}
+
+# create empty list
+loc_depth <- list()
+
+# import depth data
+for (l in libs) {
+
+  loc_depth[[l]] <- read_delim(paste("data/VCF/", l, ".ldepth.mean", sep = ""),
+                               delim = "\t") %>%
+    select(CHROM, POS, MEAN_DEPTH)
+
+}
+
+# create data frame with all information
+loc_depth <- ldply(loc_depth, data.frame) %>%
+  rename(LIB = `.id`)
+
+ggplot(loc_depth, aes(x = LIB, y = MEAN_DEPTH)) +
+  geom_boxplot() +
+  labs(y = "mean depth per locus") +
+  theme_standard +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+
+```
+
+Identify loci with large variance in mean depth across libraries and/or individuals by calculating the coefficient of variance (STD/MEAN).
+
+```{r fig.cap="Fig 12: Comparison of mean across all individual to mean weighted by library and coefficient of variance of read depth across individuals and between libraries. If loci have consistent coverage across loci the mean read depth per locus across all individuals and weighted by library should fall on the red diagonal.", fig.height=7, fig.width=8.5}
+
+# mean depth across all individuals
+temp <- read_delim("data/VCF/ONC.F2.ldepth.mean", delim = "\t") %>%
+  unite(LOCUS, CHROM, POS, sep = "-") %>%
+  mutate(STD_DEPTH = sqrt(VAR_DEPTH))
+
+# calculate mean depth weighted by library
+depth_comp <- loc_depth %>%
+  unite(LOCUS, CHROM, POS, sep = "-") %>%
+  group_by(LOCUS) %>%
+  summarise(MEAN = mean(MEAN_DEPTH),
+            STD = sd(MEAN_DEPTH)) %>%
+  left_join(temp) %>%
+  mutate(COEFF_VAR_LIB = STD/MEAN*100,
+         COEFF_VAR_IND = STD_DEPTH/MEAN_DEPTH*100)
+
+# plot comparisons
+p1 <- ggplot(depth_comp, aes(x = MEAN_DEPTH, y = MEAN)) +
+  geom_point(shape = 1) +
+  labs(x = "mean depth per locus", y = "mean weighted by lib") +
+  geom_abline(slope = 1, linetype = "dashed", color = "darkred", size = 1) +
+  theme_standard
+
+p2 <- ggplot(depth_comp, aes(x = COEFF_VAR_IND)) +
+  geom_histogram(binwidth = 10, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = quantile(COEFF_VAR_IND, .99, na.rm = TRUE)),
+                 color = "darkred", linetype = "dashed", size = 1) +
+  labs(x = "coeff var depth across all indv") +
+  theme_standard
+
+p3 <- ggplot(depth_comp, aes(x = COEFF_VAR_IND, y = COEFF_VAR_LIB)) +
+  geom_point(shape = 1) +
+  scale_x_continuous(limits = c(0, 210)) +
+  scale_y_continuous(limits = c(0, 210)) +
+  labs(x = "coeff var depth across all indv", y = "coeff var mean depth betw lib") +
+  theme_standard
+
+p4 <- ggplot(depth_comp, aes(x = COEFF_VAR_LIB)) +
+  geom_histogram(binwidth = 10, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = quantile(COEFF_VAR_LIB, .99, na.rm = TRUE)),
+                 color = "darkred", linetype = "dashed", size = 1) +
+  labs(x = "coeff var depth between lib") +
+  theme_standard
+
+multiplot(p1, p2, p3, p4, cols=2)
+
+# identify loci high variation in coverage
+SNPs_var <- depth_comp %>%
+  filter(COEFF_VAR_LIB > 150 | COEFF_VAR_IND > 175) %>%
+  separate(LOCUS, into = c("CHROM", "POS"), sep = "-") %>%
+  distinct(CHROM, POS) %>%
+  mutate(POS = as.numeric(POS))
+
+# Write contig/position to text file,
+write_delim(SNPs_var, "data/VCF/LQ_F3.loci",
+            delim = "\t", col_names = FALSE)
+
+```
+
+Remove loci flagged for high variance in depth across all individuals and between libraries (removes library effects, N = `r nrow(SNPs_var)`), remove loci with mean depth < 15 or genotype call rate < 75%.
+
+```{bash eval=FALSE, echo=TRUE}
+
+vcftools --vcf data/VCF/temp/ONC.F2.recode.vcf --out data/VCF/temp/ONC.F3a --exclude-positions data/VCF/LQ_F3.loci --min-meanDP 15 --max-missing 0.75 --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/ONC.F3a.recode.vcf --out data/VCF/ONC.F3a --depth
+vcftools --vcf data/VCF/temp/ONC.F3a.recode.vcf --out data/VCF/ONC.F3a --geno-depth
+
+```
+
+Compare mean depth and number of sites called per individual.
+
+```{r fig.cap="Fig 13: Comparison of mean depth and number of sites called per individual.", fig.height=3, fig.width=4.5}
+
+read_table2("data/VCF/ONC.F3a.idepth") %>%
+  ggplot(aes(x = N_SITES, y = MEAN_DEPTH)) +
+  geom_point(shape = 1, size = 1.5) +
+  geom_hline(yintercept = 10, linetype = "dashed", color = "darkred", size = 0.75) +
+  geom_hline(yintercept = 20, linetype = "dashed", color = "darkblue", size = 0.75) +
+  labs(x = "number of sites", y = "mean read depth") +
+  theme_standard
+
+```
+
+Individuals with higher mean depth should have less missing data (called for higher number of sites). High variance in depth can make an individual appear to have good coverage, but may have many loci with false homozgygous calls due to low genotype depth that is masked by high coverage loci.
+
+Use genotype depth file to identify individuals with high variance in read depth across loci.
+
+```{r fig.cap="Fig 14: Comparison of distribution depth per locus within individuals.", fig.height=15, fig.width=10}
+
+# number of individuals
+n <- nrow(ind_stats_F2)+2
+
+# read genotype depth & code values < 5 as missing
+gdepth <- read_table2("data/VCF/ONC.F3a.gdepth") %>%
+  gather(key = INDV, value = DEPTH, 3:n) %>%
+  mutate(DEPTH = as.numeric(gsub(-1, 0, DEPTH)),
+         DEPTH = as.numeric(gsub("\\<1\\>", 0, DEPTH)),
+         DEPTH = as.numeric(gsub("\\<2\\>", 0, DEPTH)),
+         DEPTH = as.numeric(gsub("\\<3\\>", 0, DEPTH)),
+         DEPTH = as.numeric(gsub("\\<4\\>", 0, DEPTH)))
+
+# calculate summary statistics
+idepth <- gdepth %>%
+  group_by(INDV) %>%
+  summarize(TOTAL = sum(DEPTH),
+            MAX = max(DEPTH),
+            MEAN_NON0 = mean(DEPTH[DEPTH > 0]),
+            MEAN = mean(DEPTH),
+            MEDIAN = median(DEPTH),
+            VAR = var(DEPTH),
+            STD = sd(DEPTH)) %>%
+  mutate(COEFF_VAR = STD/MEAN,
+         RATIO_MEAN_MEDIAN = MEAN/MEDIAN)
+
+idepth <- left_join(idepth, ind_stats_F2)
+
+# plot results
+p1 <- ggplot(idepth, aes(x = MAX, y = TOTAL)) +
+  geom_smooth(method = "auto",linetype = "dashed", size = 1, color = "darkred") +
+  geom_point(shape = 1) +
+  theme_standard
+
+p2 <- ggplot(idepth, aes(x = TOTAL, y = VAR)) +
+  geom_smooth(method = "auto",linetype = "dashed", size = 1, color = "darkred") +
+  geom_point(shape = 1) +
+  theme_standard
+
+p3 <- ggplot(idepth, aes(MAX, MEDIAN)) +
+  geom_smooth(method = "auto",linetype = "dashed", size = 1, color = "darkred") +
+  geom_point(shape = 1) +
+  theme_standard
+
+p4 <- ggplot(idepth, aes(x = MEAN, y = MEDIAN)) +
+  geom_smooth(method = "auto",linetype = "dashed", size = 1, color = "darkred") +
+  geom_point(shape = 1) +
+  theme_standard
+
+p5 <- ggplot(idepth, aes(x = COEFF_VAR, y = RATIO_MEAN_MEDIAN)) +
+  # geom_smooth(method = "auto",linetype = "dashed", size = 1, color = "darkred") +
+  geom_point(shape = 1) +
+  theme_standard
+
+p6 <- ggplot(idepth, aes(MEAN)) +
+  geom_histogram(binwidth = 5, color = "black", fill = "darkorange") +
+  geom_vline(xintercept = 15, color = "darkred", linetype = "dashed") +
+  theme_standard
+
+p7 <- ggplot(idepth, aes(MEDIAN)) +
+  geom_histogram(binwidth = 5, color = "black", fill = "darkorange") +
+  geom_vline(xintercept = 10, color = "darkred", linetype = "dashed") +
+  theme_standard
+
+p8 <- ggplot(idepth, aes(RATIO_MEAN_MEDIAN)) +
+  geom_histogram(binwidth = 0.05, color = "black", fill = "darkorange") +
+  theme_standard
+
+p9 <- ggplot(idepth, aes(COEFF_VAR)) +
+  geom_histogram(binwidth = 0.025, color = "black", fill = "darkorange") +
+  theme_standard
+
+p10 <- ggplot(idepth, aes(x = COEFF_VAR, y = MISS_ONC.F2)) +
+  geom_point(shape = 1) +
+  geom_hline(yintercept = 0.25, linetype = "dashed", color = "darkred", size = 0.75) +
+  theme_standard
+
+multiplot(p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, cols=2)
+
+```
+
+Flag LQ individuals based on depth (mean depth < 5 and median depth = 0).
+
+```{r}
+
+LQ_depth <- idepth %>%
+ filter(MEAN <= 5 & MEDIAN == 0) %>%
+ select(INDV)
+
+write.table(LQ_depth, "data/VCF/F3_LQ.indv",
+           col.names = TRUE, row.names = FALSE, quote = FALSE)
+
+```
+
+Remove flagged individuals (N = `r nrow(LQ_depth)`).
+
+```{bash eval=FALSE, echo=TRUE}
+
+vcftools --vcf data/VCF/temp/ONC.F3a.recode.vcf --out data/VCF/temp/ONC.F3 --remove data/VCF/F3_LQ.indv --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/ONC.F3.recode.vcf --out data/VCF/ONC.F3 --depth
+vcftools --vcf data/VCF/temp/ONC.F3.recode.vcf --out data/VCF/ONC.F3 --site-mean-depth
+vcftools --vcf data/VCF/temp/ONC.F3.recode.vcf --out data/VCF/ONC.F3 --missing-indv
+vcftools --vcf data/VCF/temp/ONC.F3.recode.vcf --out data/VCF/ONC.F3 --missing-site
+vcftools --vcf data/VCF/temp/ONC.F3.recode.vcf --out data/VCF/ONC.F3 --het
+vcftools --vcf data/VCF/temp/ONC.F3.recode.vcf --out data/VCF/ONC.F3 --hardy
+
+```
+
+Compare stats post-filtering:
+
+```{r fig.cap="Fig 15: Comparison of levels of missing data, depth, and heterozygosity per individual and locus.", fig.height=10, fig.width=8}
+
+# load stats files ----
+ind_stats_F3 <- read.ind.stats(dir = "data/VCF", vcf = "ONC.F3") %>%
+  separate(INDV, into = c("SP", "LIB", "SAMPLE_ID"), sep = "_", remove = FALSE)
+
+loc_stats_F3 <- read.loc.stats(dir = "data/VCF/", vcf = "ONC.F3")
+
+# plot missing data per indv ----
+p1 <- ggplot(ind_stats_F3, aes(x = MISS_ONC.F3)) +
+  geom_histogram(binwidth = .05, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(MISS_ONC.F3, na.rm = TRUE)),
+             color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 0.25),
+             color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "missing data per indv") +
+  theme_standard
+
+# plot read depth per indv ----
+p2 <- ggplot(ind_stats_F3, aes(x = MEAN_DEPTH_ONC.F3)) +
+  geom_histogram(binwidth = 5, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(MEAN_DEPTH_ONC.F3, na.rm = TRUE)),
+             color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 20),
+             color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "mean read depth per indv") +
+  theme_standard
+
+# plot depth vs missing ----
+p3 <- ggplot(ind_stats_F3, aes(x = MEAN_DEPTH_ONC.F3, y = MISS_ONC.F3)) +
+  geom_point() +
+  geom_vline(aes(xintercept = mean(MEAN_DEPTH_ONC.F3, na.rm = TRUE)),
+             color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 20),
+             color = "darkblue", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = mean(MISS_ONC.F3, na.rm = TRUE)),
+             color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 0.25),
+             color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "mean depth per indv", y = "% missing data") +
+  theme_standard
+
+# plot distribution missing data per locus ----
+p4 <- ggplot(loc_stats_F3, aes(x = MISS_ONC.F3)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(MISS_ONC.F3, na.rm = TRUE)),
+             color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 0.1),
+             color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "% missing data per locus") +
+  theme_standard
+
+# plot distribution mean read depth ----
+p5 <- ggplot(loc_stats_F3, aes(x = MEAN_DEPTH_ONC.F3)) +
+  geom_histogram(binwidth = 5, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(MEAN_DEPTH_ONC.F3, na.rm = TRUE)),
+             color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 20),
+             color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "mean read depth per locus") +
+  theme_standard
+
+# plot read depth vs missing data ----
+p6 <- ggplot(loc_stats_F3, aes(x = MEAN_DEPTH_ONC.F3, y = MISS_ONC.F3)) +
+  geom_point() +
+  geom_vline(aes(xintercept = mean(MEAN_DEPTH_ONC.F3, na.rm = TRUE)),
+             color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 20),
+             color = "darkblue", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = mean(MISS_ONC.F3, na.rm = TRUE)),
+             color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 0.1),
+             color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "mean depth per locus", y = "% missing data") +
+  theme_standard
+
+multiplot(p1, p2, p3, p4, p5, p6, cols=2)
+
+```
+
+
+**FILTER 4: Allele balance**
+
+AB: Allele balance at heterozygous sites: a number between 0 and 1 representing the ratio of reads showing the reference allele to all reads, considering only reads from individuals called as heterozygous.
+
+```{bash eval=FALSE, include=TRUE}
+
+cd data/VCF/temp
+
+cut -f8 ONC.F3.recode.vcf | grep -oe "AB=[[:digit:]].[[:digit:]][[:digit:]][[:digit:]]" | sed -s 's/AB=//g' > ONC.F4.AB
+
+cut -f1,2,8 ONC.F3.recode.vcf | grep  "AB=[[:digit:]].[[:digit:]][[:digit:]][[:digit:]]" > ONC.F4.ABloci
+
+```
+
+Allele balance is the ratio of reads for reference allele to all reads, considering only reads from individuals called as heterozygous. Values range from 0 - 1; allele balance (for real loci) should be approx. 0.5.
+
+```{r fig.cap="Fig 16: Distribution of allele balance across all loci.", fig.height=4, fig.width=5}
+
+# distribution of AB
+AB <- read_delim("data/VCF/temp/ONC.F4.AB", delim = "\t", col_names = "AB")
+
+ggplot(AB, aes(x = AB)) +
+  geom_histogram(binwidth = 0.025, color = "black", fill = "darkorange") +
+  geom_vline(xintercept = 0.5, color = "red", linetype = "dashed", size = 1) +
+  geom_vline(xintercept = 0.35, color = "darkblue", linetype = "dashed", size = 1) +
+  geom_vline(xintercept = 0.75, color = "darkblue", linetype = "dashed", size = 1) +
+  theme_standard
+
+```
+
+Compare relationship of allele balance, heterozygosity, and mean depth per locus.
+
+```{r fig.cap="Fig 17: Comparison of allele balance, heterozygosity, and mean depth per locus.", fig.height=14, fig.width=5}
+
+# relationship AB and depth/heterozygosity
+depth <- read_delim("data/VCF/ONC.F3.ldepth.mean", delim = "\t")
+
+hwe <- read_delim("data/VCF/ONC.F3.hwe", delim = "\t") %>%
+  select(-ChiSq_HWE) %>%
+  separate(`OBS(HOM1/HET/HOM2)`,
+           into = c("obs_hom1", "obs_het", "obs_hom2"),
+           sep = "/", convert = TRUE) %>%
+  separate(`E(HOM1/HET/HOM2)`,
+           into = c("exp_hom1", "exp_het", "exp_hom2"),
+           sep = "/", convert = TRUE) %>%
+  mutate(Ho = obs_het/(obs_hom1 + obs_hom2 + obs_het),
+         He = exp_het/(exp_hom1 + exp_hom2 + exp_het)) %>%
+  select(CHR, POS, obs_hom1, exp_hom1, obs_hom2, exp_hom2, P_HET_DEFICIT, obs_het, exp_het, P_HET_EXCESS, Ho, He, P_HWE)
+
+comp <- read_delim("data/VCF/temp/ONC.F4.ABloci",
+                   delim = "\t", col_names = c("CHROM", "POS", "tmp")) %>%
+  select(-tmp) %>%
+  bind_cols(AB) %>%
+  left_join(depth) %>%
+  left_join(hwe)
+
+# compare depth and allele balance
+p1 <- ggplot(comp, aes(x = AB, y = MEAN_DEPTH)) +
+  geom_point(shape = 1) +
+  geom_hline(yintercept = 75, color = "blue", linetype = "dashed", size = 1) +
+  geom_vline(xintercept = 0.5, color = "red", linetype = "dashed", size = 1) +
+  geom_vline(xintercept = 0.35, color = "blue", linetype = "dashed", size = 1) +
+  geom_vline(xintercept = 0.75, color = "blue", linetype = "dashed", size = 1) +
+  labs(x = "allele balance", y = "mean depth") +
+  theme_standard
+
+# compare heterozygosity and allele balance
+p2 <- ggplot(comp, aes(x = AB, y = Ho)) +
+  geom_point(shape = 21) +
+  geom_vline(xintercept = 0.5, color = "red", linetype = "dashed", size = 1) +
+  geom_vline(xintercept = 0.35, color = "blue", linetype = "dashed", size = 1) +
+  geom_vline(xintercept = 0.75, color = "blue", linetype = "dashed", size = 1) +
+  geom_hline(yintercept = 0.5, color = "red", linetype = "dashed", size = 1) +
+  scale_fill_viridis_c() +
+  labs(x = "allele balance", y = "observed heterozygosity") +
+  theme_standard
+
+p3 <- ggplot(comp, aes(x = MEAN_DEPTH, y = Ho)) +
+  geom_point(shape = 21) +
+  geom_vline(xintercept = 75, color = "blue", linetype = "dashed", size = 1) +
+  geom_hline(yintercept = 0.5, color = "red", linetype = "dashed", size = 1) +
+  labs(x = "mean depth", y = "observed heterozygosity") +
+  theme_standard
+
+multiplot(p1, p2, p3, cols = 1)
+
+```
+
+Filter contigs with SNP calls with AB > 0.35, AB > 0.75; retain loci very close to 0 (retain loci that are fixed variants). Remove genotypes if the quality sum of the reference or alternate allele was 0.
+
+```{bash, eval=FALSE, echo=TRUE}
+
+../../../scr/vcflib/bin/vcffilter -s -f "AB > 0.35 & AB < 0.75 | AB < 0.01 | AB > 0.99" -s -g "QR > 0 | QA > 0" ONC.F3.recode.vcf > ONC.F4.vcf
+
+awk '!/#/' ONC.F4.vcf | wc -l
+
+```
+
+Remaining SNPs: 47,974.
+
+
+**FILTER 5: mapping quality**
+
+```{bash eval=FALSE, echo=TRUE}
+
+cut -f8 ONC.F4.vcf | grep -oe "MQM=[0-9]*" | sed -s 's/MQM=//g' > ONC.F5.MQM
+
+cut -f8 ONC.F4.vcf | grep -oe "MQMR=[0-9]*" | sed -s 's/MQMR=//g' > ONC.F5.MQMR
+
+```
+
+Remove loci based on ratio of mapping quality for reference and alternate allele, i.e. sites that have a high discrepancy between the mapping qualities of two alleles.
+
+```{r fig.cap="Fig 18: Comparison of mapping quality for reference and alternate allele of a given locus.", fig.height=4, fig.width=5}
+
+temp <- read.table("data/VCF/temp/ONC.F5.MQM", col.names = "MQM")
+
+mapqual <- read.table("data/VCF/temp/ONC.F5.MQMR", col.names = "MQMR")
+
+mapqual <- bind_cols(mapqual, temp) %>%
+  mutate(ratio = MQM/MQMR)
+
+filter <- mapqual %>%
+  filter(ratio < 0.25 | ratio > 1.75)
+
+ggplot(mapqual, aes(x = MQM, y = MQMR)) +
+  geom_point(shape = 1, size = 1) +
+  geom_abline(intercept = 0, slope = 1, size = 1, color = "red", linetype = "dashed") +
+  geom_abline(intercept = 0, slope = 4, size = 1, color = "darkblue", linetype = "dashed") +
+  geom_abline(intercept = 0, slope = 0.571, size = 1, color = "darkblue", linetype = "dashed") +
+  geom_point(data = filter, aes(x = MQM, y = MQMR), shape = 21, color = "black", fill = "red") +
+  scale_x_continuous(limits = c(0, 65)) +
+  scale_y_continuous(limits = c(0, 65)) +
+  theme_standard
+
+```
+
+Filter loci with mapping quality ratio < 0.25 and > 1.75.
+
+```{bash eval=FALSE, include=TRUE}
+
+../../../scr/vcflib/bin/vcffilter -s -f "MQM / MQMR > 0.25 & MQM / MQMR < 1.75" ONC.F4.vcf > ONC.F5.vcf
+
+awk '!/#/' ONC.F5.vcf | wc -l
+
+```
+
+Remaining SNPs: 45.755.
+
+
+**FILTER 6: Maximum depth & Quality**
+
+Identify distribution of depth (based on original data set) to identify loci with excess coverage. Original number of individuals in data set is `r nrow(ind_stats_raw)` (INFO flags in filtered data set are are based on original number of individuals in data set). Create file with the original site depth and quality score for each site.
+
+```{bash, eval=FALSE, include=TRUE}
+
+# site depth
+cut -f8 ONC.F5.vcf | grep -oe "DP=[0-9]*" | sed -s 's/DP=//g' > ONC.F5.DEPTH
+
+# quality score
+awk '!/#/'  ONC.F5.vcf | cut -f1,2,6 > ONC.F5.loci.qual
+
+```
+
+Calculate average depth and standard deviation and compare to locus quality.
+
+```{r fig.cap="Fig 19: Depth and quality distribution for all SNP loci. Red loci are loci with low quality scores compared to their high depth.", fig.height=3, fig.width=5}
+
+# depth
+depth <- read.table("data/VCF/temp/ONC.F5.DEPTH",
+                    col.names = "depth")
+
+# quality score
+qual <- read.table("data/VCF/temp/ONC.F5.loci.qual",
+                   col.names = c("locus", "pos", "qual"))
+
+# mean depth
+mean_depth <- mean(depth$depth)
+
+# standard deviation
+std <- sd(depth$depth)
+
+# calculate cutoff
+cutoff <- sum(mean_depth + (2*std))
+
+# identify SNPs with excess (i.e. depth > mean depth + 1 standard deviation
+# and quality score < 2x the depth at that site
+df <- bind_cols(qual, depth) %>%
+  mutate(qualcutoff = 2*depth)
+
+removeloc <- df %>%
+  filter(depth > cutoff) %>%
+  filter(qual < 2*depth)
+
+# plot
+ggplot(df, aes(x = depth, y = qual)) +
+  geom_point(shape = 1) +
+  geom_point(data = removeloc, aes(x = depth, y = qual), shape = 21, color = "black", fill = "red") +
+  geom_line(data = df, aes(x = depth, y = qualcutoff), color = "blue",  linetype = "dashed", size = 1) +
+  geom_vline(xintercept = cutoff, color = "blue", linetype = "dashed", size = 1) +
+  theme_standard
+
+LQ <- removeloc %>%
+  select(locus, pos)
+
+write_delim(LQ, "data/VCF/temp/LQ_F5.loci", col_names = FALSE, delim = "\t")
+
+```
+
+Mean depth per locus (across all indivuals) is `r round(mean_depth, digits = 0)` and the standard deviation is `r round(std, digits = 2)`. Filter SNP site with depth > mean depth + 1 standard deviation = `r round(sum(mean_depth + 2*std), digits = 0)` and that have quality scores < 2x the depth at that site and output depth per site.
+
+```{bash eval=FALSE, include=TRUE}
+
+cd ../../../
+
+vcftools --vcf  data/VCF/temp/ONC.F5.vcf --exclude-positions data/VCF/temp/LQ_F5.loci --recode --recode-INFO-all --out data/VCF/temp/ONC.F6a
+
+vcftools --vcf data/VCF/temp/ONC.F6a.recode.vcf --out data/VCF/ONC.F6a --site-mean-depth
+
+```
+
+Compare the distribution of mean depth per site averaged across individuals to determine cut-off value of sites with excessively high depth indicative of paralogs/multicopy loci.
+
+```{r fig.cap="Fig 20: Mean depth per locus. Red dashed line indicates the mean depth across all loci, the dashed blue lines indicate the 95th and 99th quartiles.", fig.height=3, fig.width=5}
+
+# plot depth distribution
+read_delim("data/VCF/ONC.F6a.ldepth.mean", delim = "\t") %>%
+  ggplot(aes(x = MEAN_DEPTH)) +
+  geom_histogram(binwidth = 5, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(MEAN_DEPTH, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = quantile(MEAN_DEPTH, .95)),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = quantile(MEAN_DEPTH, .99)),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "mean depth per site") +
+  theme_standard
+
+kable(
+  read_delim("data/VCF/ONC.F6a.ldepth.mean", delim = "\t") %>%
+    count(MEAN_DEPTH > 75),
+  caption="Table 6: Number of loci with > 60 reads."
+)
+
+```
+
+Filter loci maximum mean read depth > 75 to eliminate putative paralogs.
+
+```{bash eval=FALSE, include=TRUE}
+
+vcftools --vcf  data/VCF/temp/ONC.F5.vcf --out data/VCF/temp/ONC.F6 --max-meanDP 75 --exclude-positions data/VCF/temp/LQ_F5.loci --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/ONC.F6.recode.vcf --out data/VCF/ONC.F6 --depth
+vcftools --vcf data/VCF/temp/ONC.F6.recode.vcf --out data/VCF/ONC.F6 --site-mean-depth
+vcftools --vcf data/VCF/temp/ONC.F6.recode.vcf --out data/VCF/ONC.F6 --missing-indv
+vcftools --vcf data/VCF/temp/ONC.F6.recode.vcf --out data/VCF/ONC.F6 --missing-site
+vcftools --vcf data/VCF/temp/ONC.F6.recode.vcf --out data/VCF/ONC.F6 --het
+
+```
+
+Analyze stats post-filtering:
+
+```{r fig.cap=" Fig 21: Comparison of levels of missing data and coverage per locus and individual.", fig.height=10, fig.width=10}
+
+# load stats files ----
+ind_stats_F6 <- read.ind.stats(dir = "data/VCF", vcf = "ONC.F6") %>%
+  separate(INDV, into = c("SP", "LIB", "SAMPLE_ID"), sep = "_", remove = FALSE)
+
+loc_stats_F6 <- read.loc.stats(dir = "data/VCF/", vcf = "ONC.F6")
+
+# plot missing data per indv ----
+p1 <- ggplot(ind_stats_F6, aes(x = MISS_ONC.F6)) +
+  geom_histogram(binwidth = .05, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(MISS_ONC.F6, na.rm = TRUE)),
+             color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 0.25),
+             color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "missing data per indv") +
+  theme_standard
+
+# plot read depth per indv ----
+p2 <- ggplot(ind_stats_F6, aes(x = MEAN_DEPTH_ONC.F6)) +
+  geom_histogram(binwidth = 5, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(MEAN_DEPTH_ONC.F6, na.rm = TRUE)),
+             color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 20),
+             color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "mean read depth per indv") +
+  theme_standard
+
+# plot depth vs missing ----
+p3 <- ggplot(ind_stats_F6, aes(x = MEAN_DEPTH_ONC.F6, y = MISS_ONC.F6)) +
+  geom_point() +
+  geom_vline(aes(xintercept = mean(MEAN_DEPTH_ONC.F6, na.rm = TRUE)),
+             color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 20),
+             color = "darkblue", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = mean(MISS_ONC.F6, na.rm = TRUE)),
+             color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 0.25),
+             color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "mean depth per indv", y = "% missing data") +
+  theme_standard
+
+# plot distribution missing data per locus ----
+p4 <- ggplot(loc_stats_F6, aes(x = MISS_ONC.F6)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(MISS_ONC.F6, na.rm = TRUE)),
+             color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 0.1),
+             color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "% missing data per locus") +
+  theme_standard
+
+# plot distribution mean read depth ----
+p5 <- ggplot(loc_stats_F6, aes(x = MEAN_DEPTH_ONC.F6)) +
+  geom_histogram(binwidth = 5, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(MEAN_DEPTH_ONC.F6, na.rm = TRUE)),
+             color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 20),
+             color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "mean read depth per locus") +
+  theme_standard
+
+# plot read depth vs missing data ----
+p6 <- ggplot(loc_stats_F6, aes(x = MEAN_DEPTH_ONC.F6, y = MISS_ONC.F6)) +
+  geom_point() +
+  geom_vline(aes(xintercept = mean(MEAN_DEPTH_ONC.F6, na.rm = TRUE)),
+             color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 20),
+             color = "darkblue", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = mean(MISS_ONC.F6, na.rm = TRUE)),
+             color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 0.1),
+             color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "mean depth per locus", y = "% missing data") +
+  theme_standard
+
+multiplot(p1, p2, p3, p4, p5, p6, cols=2)
+
+```
+
+Data set contains `r nrow(loc_stats_F6)` SNP sites and `r nrow(ind_stats_F6)` individuals.
+
+
+**FILTER 7: Missing data and minimum depth per locus**
+
+Filter loci with mean read depth < 15 and genotype call rate < 90%.
+
+```{bash eval=FALSE, echo=TRUE}
+
+vcftools --vcf data/VCF/temp/ONC.F6.recode.vcf --out data/VCF/temp/ONC.F7 --min-meanDP 15 --max-missing 0.9 --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/ONC.F7.recode.vcf --out data/VCF/ONC.F7 --depth
+vcftools --vcf data/VCF/temp/ONC.F7.recode.vcf --out data/VCF/ONC.F7 --site-mean-depth
+vcftools --vcf data/VCF/temp/ONC.F7.recode.vcf --out data/VCF/ONC.F7 --missing-indv
+vcftools --vcf data/VCF/temp/ONC.F7.recode.vcf --out data/VCF/ONC.F7 --missing-site
+vcftools --vcf data/VCF/temp/ONC.F7.recode.vcf --out data/VCF/ONC.F7 --het
+vcftools --vcf data/VCF/temp/ONC.F7.recode.vcf --out data/VCF/ONC.F7 --hardy
+
+# library BMAG002
+vcftools --vcf data/VCF/temp/ONC.F7.recode.vcf --out data/VCF/temp/BMAG002 --keep data/VCF/BMAG002.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG002.recode.vcf --out data/VCF/BMAG002 --hardy
+
+# library BMAG006
+vcftools --vcf data/VCF/temp/ONC.F7.recode.vcf --out data/VCF/temp/BMAG006 --keep data/VCF/BMAG006.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG006.recode.vcf --out data/VCF/BMAG006 --hardy
+
+# library BMAG007
+vcftools --vcf data/VCF/temp/ONC.F7.recode.vcf --out data/VCF/temp/BMAG007 --keep data/VCF/BMAG007.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG007.recode.vcf --out data/VCF/BMAG007 --hardy
+
+# library BMAG020
+vcftools --vcf data/VCF/temp/ONC.F7.recode.vcf --out data/VCF/temp/BMAG020 --keep data/VCF/BMAG020.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG020.recode.vcf --out data/VCF/BMAG020 --hardy
+
+# library BMAG021
+vcftools --vcf data/VCF/temp/ONC.F7.recode.vcf --out data/VCF/temp/BMAG021 --keep data/VCF/BMAG021.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG021.recode.vcf --out data/VCF/BMAG021 --hardy
+
+# library BMAG022
+vcftools --vcf data/VCF/temp/ONC.F7.recode.vcf --out data/VCF/temp/BMAG022 --keep data/VCF/BMAG022.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG022.recode.vcf --out data/VCF/BMAG022 --hardy
+
+# library BMAG023
+vcftools --vcf data/VCF/temp/ONC.F7.recode.vcf --out data/VCF/temp/BMAG023 --keep data/VCF/BMAG023.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG023.recode.vcf --out data/VCF/BMAG023 --hardy
+
+# library BMAG024
+vcftools --vcf data/VCF/temp/ONC.F7.recode.vcf --out data/VCF/temp/BMAG024 --keep data/VCF/BMAG024.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG024.recode.vcf --out data/VCF/BMAG024 --hardy
+
+# library BMAG025
+vcftools --vcf data/VCF/temp/ONC.F7.recode.vcf --out data/VCF/temp/BMAG025 --keep data/VCF/BMAG025.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG025.recode.vcf --out data/VCF/BMAG025 --hardy
+
+# library BMAG001
+vcftools --vcf data/VCF/temp/ONC.F7.recode.vcf --out data/VCF/temp/BMAG001 --keep data/VCF/BMAG001.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG001.recode.vcf --out data/VCF/BMAG001 --hardy
+
+# library BMAG008
+vcftools --vcf data/VCF/temp/ONC.F7.recode.vcf --out data/VCF/temp/BMAG008 --keep data/VCF/BMAG008.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG008.recode.vcf --out data/VCF/BMAG008 --hardy
+
+# library BMAG010
+vcftools --vcf data/VCF/temp/ONC.F7.recode.vcf --out data/VCF/temp/BMAG010 --keep data/VCF/BMAG010.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG010.recode.vcf --out data/VCF/BMAG010 --hardy
+
+# library BMAG013
+vcftools --vcf data/VCF/temp/ONC.F7.recode.vcf --out data/VCF/temp/BMAG013 --keep data/VCF/BMAG013.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG013.recode.vcf --out data/VCF/BMAG013 --hardy
+
+# library BMAG009
+vcftools --vcf data/VCF/temp/ONC.F7.recode.vcf --out data/VCF/temp/BMAG009 --keep data/VCF/BMAG009.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG009.recode.vcf --out data/VCF/BMAG009 --hardy
+
+# library BMAG017
+vcftools --vcf data/VCF/temp/ONC.F7.recode.vcf --out data/VCF/temp/BMAG017 --keep data/VCF/BMAG017.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/BMAG017.recode.vcf --out data/VCF/BMAG017 --hardy
+
+```
+
+Compare data set after filtering -
+
+```{r}
+
+# load stats files ----
+ind_stats_F7 <- read.ind.stats(dir = "data/VCF", vcf = "ONC.F7") %>%
+  separate(INDV, into = c("SP", "LIB", "SAMPLE_ID"), sep = "_", remove = FALSE)
+
+loc_stats_F7 <- read.loc.stats(dir = "data/VCF/", vcf = "ONC.F7")
+
+```
+
+Data set contains `r nrow(ind_stats_F7)` individuals and `r nrow(loc_stats_F7)` loci.
+
+
+**FILTER 8: Excess heterozygosity**
+
+Identify SNPs with more than 0.5 heterozygosity and significant excess heterozygosity.
+
+```{r fig.cap="Fig 22: Distribution of observed heterozygosity per locus.", fig.height=3, fig.width=4}
+
+# calculate observed heterozygosity
+hwe <- read_delim("data/VCF/ONC.F7.hwe", delim = "\t") %>%
+  select(-ChiSq_HWE) %>%
+  separate(`OBS(HOM1/HET/HOM2)`,
+           into = c("obs_hom1", "obs_het", "obs_hom2"),
+           sep = "/", convert = TRUE) %>%
+  separate(`E(HOM1/HET/HOM2)`,
+           into = c("exp_hom1", "exp_het", "exp_hom2"),
+           sep = "/", convert = TRUE) %>%   
+  mutate(Ho = obs_het/(obs_hom1 + obs_hom2 + obs_het),
+         He = exp_het/(exp_hom1 + exp_hom2 + exp_het)) %>%
+  select(CHR, POS, obs_hom1, exp_hom1, obs_hom2, exp_hom2, P_HET_DEFICIT, obs_het, exp_het, P_HET_EXCESS, Ho, He, P_HWE)
+
+# plot distribution of observed heterozygosity
+ggplot(hwe, aes(x = Ho)) +
+  geom_histogram(binwidth = 0.05, color = "black", fill = "darkorange") +
+  geom_vline(xintercept = 0.55, color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "observed heterozygosity") +
+  theme_standard
+
+# threshold from paper Meek et al 2019 Ho > 0.55
+excess_hwe_overall <- hwe %>%
+  filter(Ho > 0.55) %>%
+  select(CHR, POS)
+
+```
+
+Identify loci with heterozygosity > 0.5, then correct p-values for multiple comparisons using Benjamini-Hochberg method. `r nrow(excess_hwe_overall)` loci flagged to be removed from the data set.
+
+```{r}
+
+# create empty list
+lib_het <- list()
+
+# import depth data
+for (l in libs) {
+
+  lib_het[[l]] <- read_delim(paste("data/VCF/", l, ".hwe", sep = ""),
+                               delim = "\t") %>%
+  select(-ChiSq_HWE) %>%
+  separate(`OBS(HOM1/HET/HOM2)`,
+           into = c("obs_hom1", "obs_het", "obs_hom2"),
+           sep = "/", convert = TRUE) %>%
+  separate(`E(HOM1/HET/HOM2)`,
+           into = c("exp_hom1", "exp_het", "exp_hom2"),
+           sep = "/", convert = TRUE) %>%   
+  mutate(Ho = obs_het/(obs_hom1 + obs_hom2 + obs_het),
+         He = exp_het/(exp_hom1 + exp_hom2 + exp_het)) %>%
+  select(CHR, POS, obs_hom1, exp_hom1, obs_hom2, exp_hom2, P_HET_DEFICIT, obs_het, exp_het, P_HET_EXCESS, Ho, He, P_HWE)
+
+}
+
+# create data frame with all information
+lib_het <- ldply(lib_het, data.frame) %>%
+  rename(LIB = `.id`)
+
+
+# loci with Ho > 0.5
+kable(
+  lib_het %>%
+    filter(Ho > 0.75) %>%
+    count(LIB),
+  caption = "Table 7a: Number of loci with Ho > 0.75 per library."
+)
+
+kable(
+  lib_het %>%
+    filter(Ho > 0.75) %>%
+    count(CHR, POS) %>%
+    filter(n == 1) %>%
+    left_join(lib_het) %>%
+    filter(Ho > 0.75) %>%
+    count(LIB),
+  caption = "Table 7b: Number of loci with H0 > 0.75 in only one library per library")
+
+
+# # identify SNPs with Ho > 0.5 & significant
+# excess_hwe <- lib_het %>%
+#   filter(Ho > 0.5 & P_HET_EXCESS < 0.01) %>%
+#   bind_rows(excess_hwe_overall) %>%
+#   distinct(CHR, POS)
+
+excess_hwe <- lib_het %>%
+  filter(Ho > 0.55) %>%
+  bind_rows(excess_hwe_overall) %>%
+  distinct(CHR, POS)
+
+# Write contig/position to file
+write_delim(excess_hwe_overall, "data/VCF/hetexcess.loci", delim = "\t")
+
+```
+
+Compare patterns by library to determine loci that could cause library effects due to excess heterozygosity. Most loci that are out in one library are out in multiple libraries and overall loci flagged for removal in a library and/or overall).
+
+There is a known library effect for BMAG002 (strongest), BMAG008, and BMAG009 that is due to excess heterozygosity in those individuals (comparison of Fis values for duplicates from BMAG002 and BMAG017 show that Fis values are vastly different; comparing duplicates from other libraries to BMAG017 that is not the case) - using the correct p-values the number of loci out in those libraries is comparable to other libraries, using the uncorrect p-value those numbers are comparatively larger.
+
+Total of `r nrow(excess_hwe)` loci are flagged for removal.
+
+```{bash eval=FALSE, echo=TRUE}
+
+vcftools --vcf data/VCF/temp/ONC.F7.recode.vcf --out data/VCF/temp/ONC.F8 --exclude-positions data/VCF/hetexcess.loci --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/ONC.F8.recode.vcf --out data/VCF/ONC.F8 --depth
+vcftools --vcf data/VCF/temp/ONC.F8.recode.vcf --out data/VCF/ONC.F8 --site-mean-depth
+vcftools --vcf data/VCF/temp/ONC.F8.recode.vcf --out data/VCF/ONC.F8 --missing-indv
+vcftools --vcf data/VCF/temp/ONC.F8.recode.vcf --out data/VCF/ONC.F8 --missing-site
+vcftools --vcf data/VCF/temp/ONC.F8.recode.vcf --out data/VCF/ONC.F8 --het
+vcftools --vcf data/VCF/temp/ONC.F8.recode.vcf --out data/VCF/ONC.F8 --geno-depth
+
+```
+
+Compare data set -
+
+```{r}
+
+# load stats files ----
+ind_stats_F8 <- read.ind.stats(dir = "data/VCF", vcf = "ONC.F8") %>%
+  separate(INDV, into = c("SP", "LIB", "SAMPLE_ID"), sep = "_", remove = FALSE)
+
+loc_stats_F8 <- read.loc.stats(dir = "data/VCF/", vcf = "ONC.F8")
+
+```
+
+Data set contains `r nrow(loc_stats_F8)` SNP sites and `r nrow(ind_stats_F8)` individuals.
+
+
+**FILTER 9: Identify and filter LQ individuals**
+
+Use genotype depth file to identify individuals with high variance in read depth across loci.
+
+```{r}
+
+# number of individuals
+n <- nrow(ind_stats_F8)+2
+
+# read genotype depth & code values < 5 as missing
+gdepth <- read_table2("data/VCF/ONC.F8.gdepth") %>%
+  gather(key = INDV, value = GDEPTH, 3:n) %>%
+  mutate(GDEPTH = as.numeric(gsub(-1, 0, GDEPTH)),
+         DEPTH = GDEPTH,
+         DEPTH = as.numeric(gsub("\\<1\\>", 0, DEPTH)),
+         DEPTH = as.numeric(gsub("\\<2\\>", 0, DEPTH)),
+         DEPTH = as.numeric(gsub("\\<3\\>", 0, DEPTH)),
+         DEPTH = as.numeric(gsub("\\<4\\>", 0, DEPTH)),
+         MISSING = ifelse(DEPTH == 0, "missing", "genotyped"),
+         GDEPTHBIN = cut(GDEPTH,
+                         breaks = c(-1, 5, 10, 25, 50, 100, 500, max(GDEPTH)),
+                         labels = c("<5", "5-10", "10-25", "25-50", "50-100", "100-500", ">500"))) %>%
+  separate(INDV, into = c("SP", "LIB", "SAMPLE_ID"),
+           sep = "_", remove = TRUE) %>%
+  select(-SP) %>%
+  left_join(Ind_RAW) %>%
+  select(-INDV, -SP)
+
+```
+
+Compare distribution of depth within individuals.
+
+```{r fig.cap="Fig 23: Heatmap indicating genotype depth per locus for each individual by run type.", fig.height=20, fig.width=20}
+
+ggplot(gdepth, aes(x = SAMPLE_ID, y = CHROM)) +
+  geom_tile(aes(fill = GDEPTHBIN)) +
+  scale_fill_viridis_d() +
+  facet_grid(. ~ RUN, space = "free", scales = "free", drop = TRUE) +
+  labs(x = "individual", y = "locus") +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        legend.position = "bottom")
+
+kable(
+  ind_stats_F8 %>%
+    rename(LIB_ID = INDV) %>%
+    left_join(Ind_RAW) %>%
+    distinct(SAMPLE_ID, .keep_all = TRUE) %>%
+    count(RUN),
+  caption = "Table 8a: Number of individuals per run type remaining in the data set (duplicate samples excluded from counts)."
+)
+
+```
+
+Compare distribution of depth of individuals grouped by library to identify potential library effects.
+
+```{r fig.cap="Fig 24: Heatmap indicating genotype depth per locus for each individual by library.", fig.height=20, fig.width=20}
+
+ggplot(gdepth, aes(x = SAMPLE_ID, y = CHROM)) +
+  geom_tile(aes(fill = GDEPTHBIN)) +
+  scale_fill_viridis_d() +
+  facet_grid(. ~ LIB, space = "free", scales = "free", drop = TRUE) +
+  labs(x = "individual", y = "locus") +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        legend.position = "bottom")
+
+kable(
+  ind_stats_F8 %>%
+    count(LIB),
+  caption = "Table 8b: Number of individuals per library remaining in the data set."
+)
+
+```
+
+Compare distribution of genotype depths (across all individuals).
+
+```{r fig.cap="Fig 25: Comparison of genotype depth across individuals. Genotype depths < 5 are coded as missing.", fig.height=12, fig.width=12}
+
+gdepth %>%
+  group_by(LIB) %>%
+  count(GDEPTHBIN) %>%
+  ggplot(aes(x = GDEPTHBIN, y = n)) +
+    geom_bar(stat= "identity", color = "black", fill = "darkorange") +
+    facet_wrap(~ LIB) +
+    theme_facet
+
+```
+
+Determine variance in depth w/in individuals to identify problematic individuals remaining in the data set.
+
+```{r fig.cap="Fig 26: Comparison of mean/median depth, variance in depth, and missing data within individuals.", fig.height=10, fig.width=9}
+
+# calculate summary statistics
+idepth <- gdepth %>%
+  group_by(LIB_ID) %>%
+  summarize(TOTAL = sum(DEPTH),
+            MAX = max(DEPTH),
+            MEAN = mean(DEPTH),
+            MEDIAN = median(DEPTH),
+            VAR = var(DEPTH),
+            STD = sd(DEPTH)) %>%
+  mutate(COEFF_VAR = STD/MEAN,
+         RATIO_MEAN_MEDIAN = MEAN/MEDIAN)
+
+p1 <- ggplot(idepth, aes(x = MEAN, y = MEDIAN)) +
+  geom_smooth(method = "auto",linetype = "dashed", size = 1, color = "darkred") +
+  geom_point(shape = 1) +
+  theme_standard
+
+p2 <- ggplot(idepth, aes(x = MAX, y = TOTAL)) +
+  geom_smooth(method = "lm",linetype = "dashed", size = 1, color = "darkred") +
+  geom_point(shape = 1) +
+  theme_standard
+
+p3 <- ggplot(idepth, aes(x = TOTAL, y = VAR)) +
+  geom_smooth(method = "auto",linetype = "dashed", size = 1, color = "darkred") +
+  geom_point(shape = 1) +
+  theme_standard
+
+p4 <- ggplot(idepth, aes(MEDIAN)) +
+  geom_histogram(binwidth = 10, color = "black", fill = "darkorange") +
+  theme_standard
+
+p5 <- ggplot(idepth, aes(RATIO_MEAN_MEDIAN)) +
+  geom_histogram(binwidth = 0.05, color = "black", fill = "darkorange") +
+  theme_standard
+
+p6 <- ggplot(idepth, aes(COEFF_VAR)) +
+  geom_histogram(binwidth = 0.05, color = "black", fill = "darkorange") +
+  theme_standard
+
+multiplot(p1, p2, p3, p4, p5, p6, cols=2)
+
+```
+
+Compare depth, missing data, and individual heterozygosity levels.
+
+```{r fig.cap="Fig 27: Comparison of depth, missing data, and heterozygosity.", fig.height=18, fig.width=10}
+
+imiss <- read_table2("data/VCF/ONC.F8.imiss") %>%
+  select(INDV, N_DATA, F_MISS) %>%
+  separate(INDV, into = c("SP", "LIB", "SAMPLE_ID"), remove = FALSE)
+
+istats <- read_table2("data/VCF/ONC.F8.het") %>%
+  select(-N_SITES) %>%
+  separate(INDV, into = c("SP", "LIB", "SAMPLE_ID"), remove = FALSE) %>%
+  left_join(imiss) %>%
+  rename(LIB_ID = INDV) %>%
+  select(LIB_ID, SAMPLE_ID, LIB, `O(HOM)`, `F`, F_MISS) %>%
+  left_join(idepth) %>%
+  left_join(Ind_RAW)
+
+p1 <- ggplot(istats, aes(x = MEAN, y = F_MISS, fill = `F`)) +
+  geom_point(shape = 21, size = 2, color = "black") +
+  geom_hline(yintercept = 0.5, color = "darkred", linetype = "dashed") +
+  geom_vline(xintercept = 5, color = "darkred", linetype = "dashed") +
+  scale_fill_viridis_c() +
+  theme_standard
+
+p2 <- ggplot(istats, aes(x = COEFF_VAR, y = MEAN, fill = `F`)) +
+ geom_point(shape = 21, size = 2, color = "black") +
+ geom_hline(yintercept = 5, color = "darkred", linetype = "dashed") +
+ scale_fill_viridis_c() +
+ theme_standard
+
+p3 <- ggplot(istats, aes(x = `O(HOM)`, y = MEAN, fill = F_MISS)) +
+  geom_point(shape = 21, size = 2, color = "black") +
+  geom_hline(yintercept = 5, color = "darkred", linetype = "dashed") +
+  scale_fill_viridis_c() +
+  theme_standard
+
+p4 <- ggplot(istats, aes(x = MEAN)) +
+  geom_histogram(binwidth = 10, color = "black", fill = "darkorange") +
+  geom_vline(xintercept = 5, color = "darkred", linetype = "dashed") +
+  theme_standard
+
+p5 <- ggplot(istats, aes(x = `F`, y = MEAN, fill = F_MISS)) +
+  geom_point(shape = 21, size = 2, color = "black") +
+  geom_hline(yintercept = 20, color = "darkred", linetype = "dashed") +
+  geom_vline(xintercept = 0.3, color = "darkred", linetype = "dashed") +
+  scale_fill_viridis_c() +
+  theme_standard
+
+p6 <- ggplot(istats, aes(x = `F`, y = COEFF_VAR, fill = F_MISS)) +
+  geom_point(shape = 21, size = 2, color = "black") +
+  geom_vline(xintercept = 0.3, color = "darkred", linetype = "dashed") +
+  scale_fill_viridis_c() +
+  theme_standard
+
+p7 <- ggplot(istats, aes(x = `F`, y = RATIO_MEAN_MEDIAN, fill = F_MISS)) +
+  geom_point(shape = 21, size = 2, color = "black") +
+  geom_hline(yintercept = 1, color = "darkred", linetype = "dashed") +
+  geom_vline(xintercept = 0.3, color = "darkred", linetype = "dashed") +
+  scale_fill_viridis_c() +
+  theme_standard
+
+p8 <- ggplot(istats, aes(x = F_MISS)) +
+  geom_histogram(binwidth = 0.05, color = "black", fill = "darkorange") +
+  geom_vline(xintercept = 0.3, color = "darkred", linetype = "dashed") +
+  theme_standard
+
+multiplot(p1, p2, p3, p4, p5, p6, p7, p8, cols=2)
+
+```
+
+Compare patterns of distribution of Fis (homozygosity of individuals) by library and run type to identify artifacts but not eliminate real biological signal.
+
+```{r fig.cap="Fig 28: Distribution of Fis per individual grouped by library. Dashed red line is the mean level of Fis across all individuals.", fig.height=25, fig.width=6}
+
+ggplot(istats, aes(x = `F`)) +
+  geom_histogram(binwidth = 0.025, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(`F`)), color = "darkred", linetype = "dashed", size = 1) +
+  geom_vline(xintercept = c(-0.05, 0.4), color = "darkblue", linetype = "dashed") +
+  facet_grid(LIB ~ ., scales = "free_y") +
+  theme_facet
+
+```
+
+Fis can also be a biological signal. Smaller populations could have higher Fis (erosion of genetic diversity) and hybridization of populations could lead to excess heterozygosity.
+
+```{r fig.cap="Fig 29: Distribution of Fis per individual grouped by run type. Dashed red line is the mean level of Fis across all individuals.", fig.height=12, fig.width=6}
+
+ggplot(istats, aes(x = `F`)) +
+  geom_histogram(binwidth = 0.025, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(`F`)), color = "darkred", linetype = "dashed", size = 1) +
+  geom_vline(xintercept = c(-0.05, 0.4), color = "darkblue", linetype = "dashed") +
+  facet_grid(RUN ~ ., scales = "free_y") +
+  theme_facet
+
+```
+
+Winter run individuals appear to have elevated Fis, which makes biologically sense since they have a much smaller population which can lead to an increase in homozogysity due to drift and/or inbreeding. Spring run individuals having a slight left shift in their Fis values makes sense to since they are potentially hybridizing with Fall run individuals
+
+```{r fig.cap="Fig 30: Distribution of Fis across all individuals.", fig.height=4, fig.width=5}
+
+ggplot(istats, aes(x = `F`)) +
+  geom_histogram(binwidth = 0.025, color = "black", fill = "darkorange") +
+  geom_vline(xintercept = c(-0.2, 0.5), color = "darkblue", linetype = "dashed") +
+  theme_standard
+
+```
+
+In general, pervasiveness of paralogs and contamination can lead to a decrease in Fis (excess homozogysity). Biologically, this would occur if there is outbreeding/admixture between two different demes. Excess homozogygosity can be caused by false homozygotes e.g. due to low depth.
+
+Flag low quality individuals with missing data > 0.5, Fis < -0.05, or Fis > 0.4
+
+```{r}
+
+LQ_ind <- istats %>%
+  filter(F_MISS > 0.5 | `F` < -0.2 | `F` > 0.5) %>%
+  select(LIB_ID)
+
+write_delim(LQ_ind, "data/VCF/F9_LQ.indv", col_names = FALSE)
+
+```
+
+
+**FILTER 10: Missing data by sample location**
+
+```{bash eval=FALSE, echo=TRUE}
+
+vcftools --vcf data/VCF/temp/ONC.F8.recode.vcf --out data/VCF/temp/ONC.F9 --remove data/VCF/F9_LQ.indv --recode --recode-INFO-all
+
+# output per run ---------------------------------------------------------
+
+# Fall
+vcftools --vcf data/VCF/temp/ONC.F9.recode.vcf --out data/VCF/temp/FALL2 --keep data/VCF/F.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/FALL2.recode.vcf --out data/VCF/FALL2 --missing-site
+
+# Late Fall
+vcftools --vcf data/VCF/temp/ONC.F9.recode.vcf --out data/VCF/temp/LATE-FALL2 --keep data/VCF/L.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/LATE-FALL2.recode.vcf --out data/VCF/LATE-FALL2 --missing-site
+
+# Spring
+vcftools --vcf data/VCF/temp/ONC.F9.recode.vcf --out data/VCF/temp/SPRING2 --keep data/VCF/S.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/SPRING2.recode.vcf --out data/VCF/SPRING2 --missing-site
+
+# Winter
+vcftools --vcf data/VCF/temp/ONC.F9.recode.vcf --out data/VCF/temp/WINTER2 --keep data/VCF/W.ind --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/WINTER2.recode.vcf --out data/VCF/WINTER2 --missing-site
+
+```
+
+Compare levels missing data per locus per sample region to avoid non-random patterns of missing data.
+
+```{r fig.cap="Fig 31: Genotype call rate per run type.", fig.height=10, fig.width=4}
+
+# pops to loop over
+pop <- c("FALL2", "LATE-FALL2", "SPRING2", "WINTER2")
+
+loc_missing <- list()
+
+# import missing data per locus
+for (p in pop) {
+
+  loc_missing[[p]] <- read_delim(paste("data/VCF/", p, ".lmiss", sep = ""), delim = "\t") %>%
+    select(CHR, POS, F_MISS) %>%
+    mutate(POP = p)
+
+}
+
+# create data frame with all information
+loc_missing <- ldply(loc_missing, data.frame)
+
+ggplot(loc_missing, aes(x = F_MISS)) +
+  geom_histogram(binwidth = .05, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = 0.15),
+             color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "missing data per locus") +
+  scale_y_sqrt() +
+  facet_grid(POP ~ .) +
+  theme_standard
+
+# identify loci with high missing data in each region
+SNPs <- filter(loc_missing, F_MISS > 0.15) %>%
+  select(CHR, POS)
+
+kable(
+  loc_missing %>%
+    filter(F_MISS > 0.15) %>%
+    count(POP),
+  caption = "Table 9: Number of loci called in < 85% of individuals of a run type."
+)
+
+# Write to file
+write_delim(SNPs, "data/VCF/LQ_F10.loci", delim = "\t", col_names= FALSE)
+
+```
+
+Identify loci with low genotype call rate in a given sample location (> 15 % missing data) to remove loci from data set. Remove all singleton SNPs.
+
+```{bash eval=FALSE, echo=TRUE}
+
+vcftools --vcf data/VCF/temp/ONC.F9.recode.vcf --out data/VCF/temp/ONC.F10 --exclude-positions data/VCF/LQ_F10.loci --recode --recode-INFO-all
+
+vcftools --vcf data/VCF/temp/ONC.F10.recode.vcf --out data/VCF/ONC.F10 --site-quality
+vcftools --vcf data/VCF/temp/ONC.F10.recode.vcf --out data/VCF/ONC.F10 --depth
+vcftools --vcf data/VCF/temp/ONC.F10.recode.vcf --out data/VCF/ONC.F10 --site-mean-depth
+vcftools --vcf data/VCF/temp/ONC.F10.recode.vcf --out data/VCF/ONC.F10 --missing-indv
+vcftools --vcf data/VCF/temp/ONC.F10.recode.vcf --out data/VCF/ONC.F10 --missing-site
+vcftools --vcf data/VCF/temp/ONC.F10.recode.vcf --out data/VCF/ONC.F10 --het
+vcftools --vcf data/VCF/temp/ONC.F10.recode.vcf --out data/VCF/ONC.F10 --geno-depth
+
+vcftools --vcf data/VCF/temp/ONC.F10.recode.vcf --out data/VCF/ONC.F10 --012
+
+```
+
+Compare data set after filtering:
+
+```{r fig.cap="Fig 32: Distribution of missing data, read depth, and heterozygosity for loci and individuals.", fig.height=20, fig.width=10}
+
+# load stats files ----
+ind_stats_F10 <- read.ind.stats(dir = "data/VCF", vcf = "ONC.F10") %>%
+  separate(INDV, into = c("SP", "LIB", "SAMPLE_ID"), sep = "_", remove = FALSE, extra = "merge")
+
+loc_stats_F10 <- read.loc.stats(dir = "data/VCF", vcf = "ONC.F10")
+
+# plot missing data per indv ----
+p1 <- ggplot(ind_stats_F10, aes(x = MISS_ONC.F10)) +
+  geom_histogram(binwidth = .01, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(MISS_ONC.F10, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 0.25),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "missing data per indv") +
+  theme_standard
+
+# plot read depth per indv ----
+p2 <- ggplot(ind_stats_F10, aes(x = MEAN_DEPTH_ONC.F10)) +
+  geom_histogram(binwidth = 5, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(MEAN_DEPTH_ONC.F10, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 20),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "mean read depth per indv") +
+  theme_standard
+
+# plot depth vs missing ----
+p3 <- ggplot(ind_stats_F10, aes(x = MEAN_DEPTH_ONC.F10, y = MISS_ONC.F10)) +
+  geom_point() +
+  geom_vline(aes(xintercept = mean(MEAN_DEPTH_ONC.F10, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 20),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = mean(MISS_ONC.F10, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 0.25),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "mean depth per indv", y = "% missing data") +
+  theme_standard
+
+# plot Fis per indv ----
+p4 <- ggplot(ind_stats_F10, aes(x = Fis_ONC.F10)) +
+  geom_histogram(binwidth = .01, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(Fis_ONC.F10, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 0),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "Fis per indv") +
+  theme_standard
+
+# plot Fis vs missing data per indv ----
+p5 <- ggplot(ind_stats_F10, aes(x = Fis_ONC.F10, y = MISS_ONC.F10)) +
+  geom_point() +
+  geom_vline(aes(xintercept = mean(Fis_ONC.F10, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 0),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = mean(MISS_ONC.F10, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 0.25),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "Fis per indv", y = "% missing data") +
+  theme_standard
+
+# plot Fis vs mean depth per indv ----
+p6 <- ggplot(ind_stats_F10, aes(x = Fis_ONC.F10, y = MEAN_DEPTH_ONC.F10)) +
+  geom_point() +
+  geom_vline(aes(xintercept = mean(Fis_ONC.F10, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 0),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = mean(MEAN_DEPTH_ONC.F10, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 20),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "Fis per indv", y = "mean depth per indv") +
+  theme_standard
+
+
+# plot distribution missing data per locus ----
+p7 <- ggplot(loc_stats_F10, aes(x = MISS_ONC.F10)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(MISS_ONC.F10, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 0.1),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "% missing data per locus") +
+  theme_standard
+
+# plot distribution mean read depth ----
+p8 <- ggplot(loc_stats_F10, aes(x = MEAN_DEPTH_ONC.F10)) +
+  geom_histogram(binwidth = 5, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(MEAN_DEPTH_ONC.F10, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 20),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "mean read depth per locus") +
+  theme_standard
+
+# plot read depth vs missing data ----
+p9 <- ggplot(loc_stats_F10, aes(x = MEAN_DEPTH_ONC.F10, y = MISS_ONC.F10)) +
+  geom_point() +
+  geom_vline(aes(xintercept = mean(MEAN_DEPTH_ONC.F10, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 20),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = mean(MISS_ONC.F10, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 0.1),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "mean depth per locus", y = "% missing data") +
+  theme_standard
+
+# plot depth vs SNP quality ----
+site_qual <- read.table("data/VCF/ONC.F10.lqual",
+                        header = TRUE, stringsAsFactors = FALSE) %>%
+  mutate(PROB = 10^(-QUAL/10))
+
+temp <- data.frame(loc_stats_F10$MEAN_DEPTH_ONC.F10, site_qual$QUAL) %>%
+  rename(depth = loc_stats_F10.MEAN_DEPTH_ONC.F10, qual = site_qual.QUAL)
+
+p10 <- ggplot(temp, aes(x = depth, y = qual)) +
+  geom_point(size = 1) +
+  geom_vline(aes(xintercept = mean(depth, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 20),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = mean(qual, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 20),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "mean depth per locus", y = "SNP quality") +
+  theme_standard
+
+multiplot(p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, cols=2)
+
+istats <- ind_stats_F0 %>%
+  select(-SP, -SAMPLE_ID) %>%
+  left_join(ind_stats_F10) %>%
+  select(INDV, MISS_ONC.F0, MISS_ONC.F10,
+         MEAN_DEPTH_ONC.F0, MEAN_DEPTH_ONC.F10,
+         Fis_ONC.F0, Fis_ONC.F10)
+
+```
+
+
+## Final thresholds values for filtered data set:
+
+* minimum sequence quality (minQ): 20
+* minimum genotype quality (minGQ): 20
+* minimum genotype call rate per locus (geno): 90%
+* minimum genotype call rate by population: 85%
+* maximum allowed missing data per individual (missInd): 50%
+* minimum genotype call rate by library: 50%
+* minimum genotype depth (minD): 5
+* minimum mean depth per locus (m-minD): 15
+* minimum mean depth per locus for loci grouped by library: 10
+* mean maximum depth (m-minD): 70
+* filtered for allelic balance, mapping quality, depth/quality ratio, and excess heterozygosity.
+* only bi-allelic SNPs retained.
+
+Data set contains `r nrow(loc_stats_F10)` SNP sites and `r nrow(ind_stats_F10)` individuals.
+
+
+# Haplotyping
+
+## Prep for haplotyping
+
+Create list of individuals retained in final vcf file.
+
+```{bash eval=FALSE, echo=TRUE}
+
+vcftools --vcf data/VCF/temp/ONC.F10.recode.vcf --out data/HAPLOTYPING/temp/ONC --recode --recode-INFO-all
+
+scr/vcflib/bin/vcfsamplenames data/HAPLOTYPING/temp/ONC.recode.vcf > data/HAPLOTYPING/temp/ONC.individuals
+
+```
+
+Use `ONC.individuals` to create `popmap` as a tab-separated file of individuals and their population designation, with one individual per line (make sure UNIX format). This file is needed to write the genepop file, if not provided the script will run through the process but not write a genepop file and place into same folder `rad_haplotyper.pl` will be run from.
+
+```{r}
+
+popmap <- read.table("data/HAPLOTYPING/temp/ONC.individuals",
+                     col.names = "INDV", stringsAsFactors = FALSE) %>%
+  separate(INDV, into = c("SP", "LIB", "SAMPLE_ID"), sep = "_", remove = FALSE, extra = "merge") %>%
+  select(INDV, SP)
+
+write.table(popmap, "data/HAPLOTYPING/temp/popmap",
+            col.names = FALSE, row.names = FALSE, quote = FALSE)
+
+```
+
+Place all necessary files in `data/HAPLOTYPING/temp` directory (bam, fastq, reference.fasta, vcf-file)
+
+```{bash, eval=FALSE, echo=TRUE}
+
+ln -s $HOME/CHINOOK/data/SEQ/*/*.fq.gz $HOME/CHINOOK/data/HAPLOTYPING/temp/
+
+ln -s $HOME/CHINOOK/data/SNP_CALLING/*.bam* $HOME/CHINOOK/data/HAPLOTYPING/temp/
+
+# need to rename bam files so sample names as fastq (i.e. remove the fil part)
+cd data/HAPLOTYPING/temp/
+
+cp $HOME/CHINOOK/data/SNP_CALLING/mapped.bed $HOME/CHINOOK/data/HAPLOTYPING/temp/
+
+cp $HOME/CHINOOK/data/REF/CHRIST2018/reference.fasta* $HOME/CHINOOK/data/HAPLOTYPING/temp/
+
+```
+
+Make haplotyping process more efficient by filtering `mapped.bed` file to only consist of intervals that contain SNPs in the filtered data set.
+
+```{r}
+
+contigs <- read.loc.stats(dir = "data/VCF", vcf = "ONC.F10") %>%
+  select(CHR, POS) %>%
+  distinct(CHR)
+
+bed <- read_delim("data/HAPLOTYPING/temp/mapped.bed", delim = "\t",
+                  col_names = c("CHR", "chromStart", "chromEnd")) %>%
+            filter(CHR %in% contigs$CHR)
+
+write_delim(bed, "data/HAPLOTYPING/temp/mapped_filtered.bed", delim = "\t")
+
+```
+
+
+## Run Haplotyper
+
+```{bash eval=FALSE, echo=TRUE}
+
+export PATH=$PATH:$HOME/miniconda3/bin
+
+# make sure rad_haplotyper environment is installed
+# conda create -n rad_haplotyper_env rad_haplotyper
+
+# open bioconda environment
+source activate $HOME/miniconda3/envs/rad_haplotyper_env
+
+    # run rad_haplotyper
+    perl rad_haplotyper.pl -v ONC.recode.vcf -b mapped_filtered.bed -r reference.fasta -x 30 -d 10 -z 3 -m .25 -g ONC.gen -p popmap -e --vcfout ONC.haplotyped.vcf
+
+# close bioconda environment
+source deactivate
+
+```
+
+Remove intermediate files and copy files for analysis into `data/Haplotyping/`-folder.
+
+```{bash eval=FALSE, echo=TRUE}
+
+# delete softlinks to fastq/bam files and unneeded log-files
+rm $HOME/CHINOOK/data/HAPLOTYPING/temp/*.fq.gz
+rm $HOME/CHINOOK/data/HAPLOTYPING/temp/*.bam*
+rm $HOME/CHINOOK/data/HAPLOTYPING/temp/reference.fasta*
+rm $HOME/CHINOOK/data/HAPLOTYPING/temp/log.txt
+rm $HOME/CHINOOK/data/HAPLOTYPING/temp/hap_loci.txt
+rm $HOME/CHINOOK/data/HAPLOTYPING/temp/haplo_recode.log
+rm $HOME/CHINOOK/data/HAPLOTYPING/temp/fail.log
+rm $HOME/CHINOOK/data/HAPLOTYPING/temp/hap_log.out
+rm $HOME/CHINOOK/data/HAPLOTYPING/temp/haplo_dump.out
+rm $HOME/CHINOOK/data/HAPLOTYPING/temp/allele_dump.out
+rm $HOME/CHINOOK/data/HAPLOTYPING/temp/snp_dump.out
+rm $HOME/CHINOOK/data/HAPLOTYPING/temp/rad_haplotyper.pl
+
+# copy genepop files and stats files into main haplotyping directory
+cp $HOME/CHINOOK/data/HAPLOTYPING/temp/ind_stats.out $HOME/CHINOOK/data/HAPLOTYPING/
+cp $HOME/CHINOOK/data/HAPLOTYPING/temp/stats.out $HOME/CHINOOK/data/HAPLOTYPING/
+cp $HOME/CHINOOK/data/HAPLOTYPING/temp/ONC.gen $HOME/CHINOOK/data/HAPLOTYPING/
+cp $HOME/CHINOOK/data/HAPLOTYPING/temp/codes.ONC.gen $HOME/CHINOOK/data/HAPLOTYPING/
+cp $HOME/CHINOOK/data/HAPLOTYPING/temp/ONC.haplotyped.vcf $HOME/CHINOOK/data/HAPLOTYPING/
+
+```
+
+# Haplotype filtering
+
+## Overview of haplotyping success
+
+Comparison of the number of loci that were filtered due to excess number of missing data or suspected paralogs during the haplotyping process to those that passed. Haplotyer was run without any threshold values except `-m 0.25`, i.e. loci missing in > 75% individuals are filtered.
+
+The `genepop`-file only contains loci that passed haplotyping stage.
+
+```{r fig.cap="Fig 34: Number of loci that passed haplotyping process.", fig.height=3, fig.width=3}
+
+# import stats files generated by haplotyper
+hap_stats <- read.hap.stats("data/HAPLOTYPING/stats.out")
+
+# number of haplotypes before cut-offs
+n_hap <- nrow(hap_stats)
+
+hap_ind_stats <- read_delim("data/HAPLOTYPING/ind_stats.out", delim = "\t")
+
+# view comparison of filtered vs. passed loci
+ggplot(hap_stats, aes(x = Status)) +
+  geom_bar(stat = "count", color = "black", fill = "darkorange") +
+  theme_standard
+
+```
+
+Filtered loci were almost all removed due to individuals being flagged for that locus for coverage/genotyping error issues (resulting in high missing data).
+
+```{r fig.cap="Fig 35: Haplotyping success and distribution of number of loci flagged as potential paralogs/genotyping error. Loci that did not pass haplotyping process have already been removed.", fig.height=6, fig.width=9}
+
+# remove filtered loci from data set
+hap_stats <- remove.filtered.haps(hap_stats)
+
+plot.hap.stats(hap_stats)
+
+```
+
+`r nrow(hap_stats)` loci passed haplotyping process; data set contains `r nrow(hap_ind_stats)` individuals:
+
+```{r fig.cap="Fig 36: Haplotyping stats per individual.", fig.height=7, fig.width=9}
+
+plot.ind.hap.stats(hap_ind_stats)
+
+```
+
+
+## Identify threshold values to filter data set
+
+**Genotype call rate**
+
+```{r fig.cap="Fig 37: Missing data per locus (genotypes flagged as potential paralogs or as affected by genotyping error due to low coverage are flagged as missing.", fig.height=4, fig.width=8}
+
+p1 <- ggplot(hap_stats, aes(x = Prop_Haplotyped)) +
+  geom_histogram(binwidth = 0.025, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(Prop_Haplotyped, na.rm = TRUE)),
+                 color = "darkred", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 0.9),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = " ") +
+  theme_standard
+
+p2 <- ggplot(hap_stats, aes(x = Prop_Haplotyped, y = Poss_Paralog)) +
+  geom_point(shape = 21, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(Prop_Haplotyped, na.rm = TRUE)),
+                 color = "darkred", linetype = "dashed", size = 1) +
+  labs(x = "proportion individuals haplotyped", y = "possible paralogs") +
+  theme_standard
+
+p3 <- ggplot(hap_stats, aes(x = Prop_Haplotyped, y = `Low_Cov.Geno_Err`)) +
+  geom_point(shape = 21, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(Prop_Haplotyped, na.rm = TRUE)),
+                 color = "darkred", linetype = "dashed", size = 1) +
+  labs(x = " ", y = "low coverage error") +
+  theme_standard
+
+multiplot(p1, p2, p3, cols = 3)
+
+# number of loci called in >90% individuals
+kable(
+  hap_stats %>%
+    count(Prop_Haplotyped < 0.9),
+  caption = "Table 10: Loci with < 90% genotype call rate.")
+
+# create vector of loci to remove (choose cut-off)
+Prop_Haplotyped <- filter.loci.prop_haplotyped(hap_stats, 0.9)
+
+```
+
+`r length(Prop_Haplotyped)` loci were flagged as for genotype call rate < 0.9.
+
+
+**Number of individuals flagged as paralog per locus**
+
+Loci are flagged as possible paralogs for an individuals when more than the expected number of haplotypes based on the SNP genotype call (homozygote, heterozygote) are detected, which can be indicative of paralogs (reads from two different loci being mapped to the same location on the genome).
+
+Cut-offs for loci flagged in
+
+* 1 % of individuals: `r nrow(hap_ind_stats)*0.01`
+* 5 % of individuals: `r nrow(hap_ind_stats)*0.05`
+
+```{r fig.cap="Fig 38: Proportion of individuals flagged as potential paralog.", fig.height=3, fig.width=4}
+
+ggplot(hap_stats, aes(x = Poss_Paralog)) +
+  geom_histogram(binwidth = 2, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(Poss_Paralog, na.rm = TRUE)),
+                 color = "darkred", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = (nrow(hap_ind_stats)*0.01)),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  scale_y_sqrt() +
+  labs(x = "possible paralogs per locus") +
+  theme_standard
+
+
+# number of loci with Poss_Paralogs
+kable(
+  hap_stats %>%
+  count(Poss_Paralog > 5),
+  caption = "Table 11: Loci flagged as possible paralogs in > 5 individuals.")
+
+# create vector of loci to remove (choose cut-off)
+Poss_Paralogs <- filter.loci.paralogs(hap_stats, 5)
+
+```
+
+Flag loci that are flagged as potential paralogs in 5 or more individuals. `r length(Poss_Paralogs)` loci were flagged as possible paralogs.
+
+
+**Number of SNPs & Haplotypes per locus**
+
+Each locus varies in the number of SNPs detected which determines the number of haplotypes expected in that population.
+
+```{r fig.cap="Fig 39: Distribution of number of SNPs per locus. Dark red dashed line is the mean number of SNPs per locus.", fig.height=3, fig.width=4}
+
+ggplot(hap_stats, aes(x = Sites)) +
+  geom_histogram(binwidth = 1, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(Sites, na.rm = TRUE)),
+                 color = "darkred", linetype = "dashed", size = 1) +
+  scale_x_continuous(limits = c(0, 8)) +
+  labs(x = "number of SNPs per contig") +
+  theme_standard
+
+```
+
+Filtering loci based on number of SNPs contained on that locus could bias the data set as loci with high recombination may be removed. On the other hand, assuming an approximate length of 150 bp loci with more than `r 150*0.1` SNPs would mean that 10% of bases are a polymorphisms.
+
+```{r fig.cap="Fig 40: Relationship of number of times a locus is flagged as a potential paralog and number of SNPs/haplotypes per locus.", fig.height=3, fig.width=8}
+
+p1 <- ggplot(hap_stats, aes(x = Haplotypes, y = Poss_Paralog)) +
+  geom_point(shape = 21, color = "black", fill = "darkorange") +
+  geom_smooth(method = "lm") +
+  labs(x = "no. haplotypes", y = "possible paralogs") +
+  theme_standard
+
+p2 <- ggplot(hap_stats, aes(x = Sites, y = Poss_Paralog)) +
+  geom_point(shape = 21, color = "black", fill = "darkorange") +
+  geom_smooth(method = "lm") +
+  labs(x = "no. of sites", y = " ") +
+  theme_standard
+
+multiplot(p1, p2, cols = 2)
+
+```
+
+Assuming that mutation is the only mechanism resulting in new haplotypes, the maximum expected number of haplotypes per locus is number of SNPs N + 1.
+
+```{r fig.cap="Fig 41: Comparison of number of (extra) haplotypes per locus and number of times a locus was flagged as a potentials paralogs or affected by genotyping error/low coverage.", fig.height=12, fig.width=10}
+
+p1 <- ggplot(hap_stats, aes(x = Haplotypes)) +
+  geom_histogram(binwidth = 1, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(Haplotypes, na.rm = TRUE)),
+                 color = "darkred", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = quantile(Haplotypes, .99, na.rm = TRUE)),
+                 color = "darkred", linetype = "dashed", size = 1) +
+  labs(x = "# haplotypes per locus", y = "# loci") +
+  theme_standard
+
+temp <- hap_stats %>%
+  select(Locus, Sites, Haplotypes, Prop_Haplotyped, Low_Cov.Geno_Err, Poss_Paralog) %>%
+  mutate(exp_sites = Sites + 1) %>%
+  mutate(xtra = Haplotypes - Sites)
+
+p2 <- ggplot(temp, aes(x = Sites, y = Poss_Paralog)) +
+  geom_point() +
+  geom_hline(yintercept = 5, color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "# SNP sites per locus", y = "possible paralogs") +
+  theme_standard
+
+p3 <- ggplot(temp, aes(x = Sites, y = xtra)) +
+  geom_point() +
+  geom_hline(yintercept = 0, color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "# SNP sites per locus", y = "# extra haplotypes") +
+  theme_standard
+
+p4 <- ggplot(temp, aes(x = xtra, y = Prop_Haplotyped)) +
+  geom_point(size = 1) +
+  geom_hline(yintercept = 0.9, color = "darkblue", linetype = "dashed", size = 1) +
+  geom_vline(xintercept = 0, color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "# extra haplotypes", y = "proportion of indv haplotyped") +
+  theme_standard
+
+p5 <- ggplot(temp, aes(x = xtra, y = Low_Cov.Geno_Err)) +
+  geom_point(size = 1) +
+  geom_hline(yintercept = 5, color = "darkblue", linetype = "dashed", size = 1) +
+  geom_vline(xintercept = 0, color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "# extra haplotypes", y = "potential genotyping error") +
+  theme_standard
+
+p6 <- ggplot(temp, aes(x = xtra, y = Poss_Paralog)) +
+  geom_point(size = 1) +
+  geom_hline(yintercept = 5, color = "darkblue", linetype = "dashed", size = 1) +
+  geom_vline(xintercept = 0, color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "# extra haplotypes", y = "possible paralogs") +
+  theme_standard
+
+multiplot(p1, p2, p3, p4, p5, p6, cols = 2)
+
+```
+
+
+**Number of times locus is flagged as low coverage/genotyping error**
+
+After combining SNPs on the same contig during the haplotyping process, it is possible to observe fewer than the expected number of haplotypes based on the genotype call (heterozygote/homozygote). When this occurs, that genotype is coded as missing. For each locus the number of individuals for which is it flagged as a potential a potential genotyping error or suffering from null alleles due to low coverage detected for a given locus is recorded.
+
+```{r fig.cap="Fig 42: Distribution of number of individuals a locus is flagged as potentially affected by genotyping error/low depth. The red dashed line indicates the mean number of individuals flagged, the blue dashed lines indicates 1% of individuals being flagged.", fig.height=4, fig.width=5}
+
+ggplot(hap_stats, aes(x = Low_Cov.Geno_Err)) +
+  geom_histogram(binwidth = 5, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(Low_Cov.Geno_Err, na.rm = TRUE)),
+                 color = "darkred", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = (nrow(hap_ind_stats)*0.01)),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "potential genotyping error") +
+  theme_standard
+
+# summary of count of possible genotyping errors
+kable(
+  hap_stats %>%
+    count(Low_Cov.Geno_Err > 5),
+  caption = "Table 12: Number of loci that have been flagged as affected by genotyping error/low coverage in > 5 individuals."
+)
+
+# create vector of loci to remove
+Geno_Err <- filter.loci.geno_err(hap_stats, 5)
+
+```
+
+Loci with pronounced patterns of genotyping error likely due to low coverage will have low success rate for genotyping, i.e. they will be caught in missing data filters. Coverage issues are likely genotype specfic; previous filters have targeted loci and individuals with high variance in coverage and suspect genotpes have been coded as missing, i.e. this filter need not be very conservative, regardless, loci that are repeatedly being flagged as problematic should be removed.
+
+
+**Individuals with low proportion of successfully haplotyped loci**
+
+Loci that are not successfully haplotyped in an individual are coded as missing for that individual. Problematic individual can be identified as having a high proportion of missing data.
+
+```{r fig.cap="Fig 43: Distribution of missing data per individual", fig.height=4, fig.width=5}
+
+ggplot(hap_ind_stats, aes(x = Prop_Success)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(Prop_Success, na.rm = TRUE)),
+                 color = "darkred", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 0.75),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "proportion loci successfully haplotyped") +
+  theme_standard
+
+# count individuals above set threshold
+kable(
+  hap_ind_stats %>%
+    count(Prop_Success < .5),
+  caption = "Table 13: Number of individuals genotyped for < 50% loci."
+)
+
+```
+
+Problem individuals can be identified by choosing a cut-off value for the minium proportion of sucessfully haplotyped loci and excluding individuals below that threshold value. Removing loci with low haplotyping success with decrease the amount of missing data. Therefore, final missing data cut-offs should be applied *after* removing those loci from the data set, though it can be helpful to flag potentially problematic individuals based on their haplotyping stats at this point.
+
+
+**Possible paralogs per individual**
+
+Individuals with high proportion of loci flagged as possible paralogs should be flagged as potential problem individuals.
+
+1% of loci: `r nrow(hap_stats)*0.01`
+
+```{r fig.cap="Fig 44: Distribution of no of loci flagged as potetnial paralogs within an individal", fig.height=4, fig.width=5}
+
+ggplot(hap_ind_stats, aes(x = Poss_Paralogs)) +
+  geom_histogram(binwidth = 10, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(Poss_Paralogs, na.rm = TRUE)),
+                 color = "darkred", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = (nrow(hap_stats)*0.01)),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "no of loci potential paralogs") +
+  theme_standard
+
+# count individuals above set threshold
+kable(
+  hap_ind_stats %>%
+    count(Poss_Paralogs > 145),
+  caption = "Table 14: Number of individuals with > 145 loci (1% of loci) flagged as potential paralogs."
+)
+
+```
+
+Cut-off for individuals with loci flagged paralogs in > 1% of loci is `r nrow(hap_stats)*0.01`. The highest number of flagged loci in an individuals is `r max(hap_ind_stats$Poss_Paralogs, na.rm = TRUE)`, which is equivalent to `r round(max(hap_ind_stats$Poss_Paralogs, na.rm = TRUE)/nrow(hap_stats), digits = 4)*100`% of loci.
+
+
+**Individuals with high proportion of genotyping error/low coverage issues**
+
+```{r fig.cap="Fig 45: Number of loci flagged as potential genotyping error/low coverage per individual.", fig.height=3, fig.width=4}
+
+ggplot(hap_ind_stats, aes(x = `Low_Coverage/Errors`)) +
+  geom_histogram(binwidth = 50, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(`Low_Coverage/Errors`, na.rm = TRUE)),
+                 color = "darkred", linetype = "dashed", size = 1) +
+  labs(x = "# loci potential genotyping error", y = "# indv") +
+  theme_standard
+
+```
+
+Loci that are systematically affected by potential low coverage/genotyping error have been removed from the data set, individuals that are systematically affected will have more missing data which should be adjusted after problematic individuals have been removed from the data set.
+
+
+## Filter flagged loci
+
+Load genepop file with haplotyped loci and remove flagged loci from the data set.
+
+```{r}
+
+# import genepop file
+gen <- read.genepop(file = "data/HAPLOTYPING/ONC.gen",
+                    ncode = 3L, quiet = FALSE)
+
+writeLines("haplotyped data set")
+gen
+
+n_succ <- nLoc(gen)
+
+# remove flagged loci
+removeloc <- c(Poss_Paralogs, Geno_Err, Prop_Haplotyped)
+
+gen <- genind.rem.loci(gen, removeloc)
+
+writeLines("haplotyped data set after removing flagged loci")
+gen
+
+n_fil <- nLoc(gen)
+
+```
+
+A total of `r n_hap-n_fil` SNP-containing loci were removed from the data set after haplotyping (this includes the loci filtered during the haplotyping process itself due to missing data).
+
+```{r}
+
+# format strata
+strata <- as.data.frame(indNames(gen)) %>%
+  rename(LIB_ID = `indNames(gen)`) %>%
+  separate(LIB_ID, into = c("SP", "LIB", "SAMPLE_ID"),
+           sep = "_", remove = FALSE, extra = "merge") %>%
+  separate(SAMPLE_ID, into = c("RUN", "YEAR", "INDV", "LOCATION"),
+           sep = c(1, 3, 7), remove = FALSE) %>%
+  mutate(LOCATION = ifelse(LOCATION %in% c("7FRH", "8FRH"), "FRH", LOCATION))
+
+# some samples from MRH (Merced R Fish Hatchery) have different format
+MRH <- strata %>%
+  filter(grepl("FEM", LIB_ID) | grepl("Male", LIB_ID)) %>%
+  select(LIB_ID, SP, LIB, SAMPLE_ID) %>%
+  mutate(RUN = "F",
+         YEAR = NA,
+         INDV = NA,
+         LOCATION = "MRH")
+
+# add df back together
+strata <- strata %>%
+  filter(!SAMPLE_ID %in% MRH$SAMPLE_ID) %>%
+  bind_rows(MRH) %>%
+  mutate(YEAR = ifelse(is.na(YEAR), NA, glue("200{YEAR}"))) %>%
+  select(-SP)
+
+rm(MRH)
+
+# write to file
+# write_delim(strata, "data/POPGEN/Sample_Info.txt", delim = "\t")
+
+strata(gen) <- strata
+
+kable(
+  strata %>%
+    distinct(SAMPLE_ID, .keep_all = TRUE) %>%
+    mutate(RUN = ordered(RUN, levels = c("F", "L", "W", "S")),
+           LOCATION = ordered(LOCATION, levels = tributaries)) %>%
+    count(RUN, LOCATION) %>%
+    spread(key = RUN, value = n),
+  caption = "Table 15: Samples remaining in data set by run type and river location."
+)
+
+```
+
+
+# Heterozygosity and HWE
+
+## Compare patterns of heterozygosity
+
+Generate summary statistics overall and for individuals grouped by run type and location (remove duplicates before calculating).
+
+```{r}
+
+# remove duplicate samples
+dup <- strata %>%
+  count(SAMPLE_ID) %>%
+  filter(n == 2)
+
+tmp <- gen.ind.rem.Ind(gen, dup$LIB_ID)
+
+# define groups using strata information
+setPop(tmp) <- ~RUN
+
+# generate genetic diversity stats
+GenDiv.1 <- adegenet::summary(tmp)
+
+dat <- genind2hierfstat(tmp)
+GenDiv.2 <- basic.stats(dat)
+
+```
+
+Compare observed (Ho) and expected (He) heterozygosity for all individuals across all populations.
+
+```{r fig.cap="Fig 46: Observed and expected heterozygosity per locus across all individuals.", fig.height=4, fig.width=4}
+
+# observed heterozygosity per locus
+Ho <- as.data.frame(GenDiv.1$Hobs) %>%
+  rownames_to_column("LOCUS") %>%
+  rename(Ho = `GenDiv.1$Hobs`)
+
+# expected heterozygosity per locus
+Hs <- as.data.frame(GenDiv.1$Hexp) %>%
+  rownames_to_column("LOCUS") %>%
+  rename(Hexp = `GenDiv.1$Hexp`)
+
+# expected and observed heterozysity per locus
+Het <- left_join(Ho, Hs, by = "LOCUS")
+
+# plot Ho vs Hs across all individuals
+Het %>%
+  filter(Ho != 0) %>%
+  ggplot(aes(x = Ho, y = Hexp)) +
+    geom_point() +
+    geom_abline(intercept = 0, slope = 1,
+                color = "red", linetype = "dashed", size = 1) +
+    xlim(0, 1) +
+    ylim(0, 1) +
+    labs(x = "observed heterozygosity Ho",
+         y = "within cluster diversity Hs (Hexp)") +
+  theme_standard
+
+# identify and remove monomorphic loci
+monomorphic <- filter(Ho, Ho == 0)
+
+# remove flagged loci
+removeloc <- monomorphic$LOCUS
+gen <- genind.rem.loci(gen, removeloc)
+
+```
+
+Identify loci that are now monomorphic (e.g. because individuals were removed during SNP filtering since no maf filter was applied they stay in the data set). `r nrow(monomorphic)` monomorphic loci removed.
+
+Compare distribution of observed heterozygosity (Ho) in each putative population:
+
+```{r fig.cap="Fig 47: Observed and expected heterozygosity per locus for individuals grouped by run type and river location.", fig.height=4, fig.width=10}
+
+Ho_per <- as.data.frame(GenDiv.2$Ho) %>%
+  rownames_to_column("LOCUS") %>%
+  gather(Group, Ho, 2:5)
+
+Hs_per <- as.data.frame(GenDiv.2$Hs) %>%
+  rownames_to_column("LOCUS") %>%
+  gather(Group, Hs, 2:5)
+
+# join data frames
+Het_per <- left_join(Hs_per, Ho_per) %>%
+    mutate(Group = ordered(Group, levels = c("F", "L", "W", "S")))
+
+# plot per run
+ggplot(Het_per, aes(x = Ho, y = Hs)) +
+  geom_point(shape = 19, size = 1) +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed", size = 1) +
+  xlim(0, 1) +
+  ylim(0, 1) +
+  facet_grid(. ~ Group) +
+  labs(x = "observed heterozygosity Ho", y = "within cluster diversity Hs (Hexp)") +
+  theme_standard
+
+```
+
+
+## Test for deviations from Hardy-Weinberg equilibrium within each group
+
+```{r eval=FALSE, echo=TRUE}
+
+# groups being tested
+popNames(tmp)
+
+# run HWE test per group and overall
+sep <- seppop(tmp)
+
+HWE <-sep %>%
+   lapply(hw.test, B = 100)
+
+HWE[["ALL"]] <- hw.test(tmp, B = 100)
+
+# convert to data.frames
+hwe <- list()
+
+for (m in names(HWE)) {
+   hwe[[m]] <- as.data.frame(HWE[[m]]) %>%
+   rename(pval = Pr.exact) %>%
+   rownames_to_column("LOCUS") %>%
+   select(LOCUS, pval)
+}
+
+hwe <- ldply(hwe, data.frame) %>%
+   rename(POP = `.id`) %>%
+   mutate(HWE = ifelse(pval <= 0.05, "OUT", "IN"),
+          POP = case_when(POP == "F" ~ "Fall",
+                          POP == "L" ~ "Late-Fall",
+                          POP == "S" ~ "Spring",
+                          POP == "W" ~ "Winter",
+                          POP == "ALL" ~ "OVERALL"))
+
+write_delim(hwe, "results/by_run.hwe", delim = "\t")
+
+```
+
+Compare number of loci flagged as out of HWE (individuals grouped by run).
+
+```{r fig.cap="Fig 48: Number of loci flagged as out of HWE per run type.", fig.height=4, fig.width=10}
+
+hwe <- read_delim("results/by_run.hwe", delim = "\t")
+
+# compare number of loci out per group
+hwe_perpop <- hwe %>%
+  group_by(POP) %>%
+  count(HWE) %>%
+  ungroup() %>%
+  mutate(POP = ordered(POP, levels = c("OVERALL", "Fall", "Late-Fall", "Winter", "Spring")))
+
+# plot data
+ggplot(hwe_perpop, aes(x = HWE, y = n, fill = HWE)) +
+  geom_bar(stat = "identity", color = "black") +
+  labs(x = "significant deviation from HWE (p > 0.05)",
+       y = "number of loci") +
+  scale_fill_manual(values = c("darkorange", "gold")) +
+  facet_grid( ~ POP) +
+  theme_standard
+
+```
+
+Identify loci that are consistently flagged as out of HWE across run types.
+
+```{r fig.cap="Fig 49: Number of times a locus is flagged as being out of HWE.", fig.height=3, fig.width=4}
+
+# compare number of times a locus is flagged as out
+hwe_perloc <- hwe %>%
+  filter(POP != "ALL") %>%
+  group_by(LOCUS) %>%
+  count(HWE) %>%
+  filter(HWE == "OUT")
+
+ggplot(hwe_perloc, aes(x = n)) +
+  geom_histogram(binwidth = 1, color = "black", fill = "darkorange") +
+  labs(x = "no populations out of HWE", y = "no. loci") +
+  theme_standard
+
+```
+
+No loci removed based on HWE because groups of "randomly mating" individuals are difficult to discern *a priori* (tributaries within run types but some straying). As expected, more loci are flagged as out of HWE when testing across all individuals, and for larger samples encompassing individuals from more different tributaries (Fall, Spring).
+
+
+# Compare duplicate individuals
+
+```{r fig.cap="Fig 50: Genotyping error frequency per individual.", fig.width=5, fig.height=5}
+
+# extract genotype matrix
+df <- genind2df(gen,
+                usepop = TRUE,
+                sep = ":", oneColPerAll = FALSE) %>%
+  select(-pop) %>%
+  rownames_to_column()
+
+# create list of duplicates
+pairs <- list()
+
+# input each set of duplicates as a vector of a list
+pairs[[1]] <- c("ONC_BMAG010_F030118BUT", "ONC_BMAG017_F030118BUT")
+pairs[[2]] <- c("ONC_BMAG010_L030057USR", "ONC_BMAG017_L030057USR")
+pairs[[3]] <- c("ONC_BMAG010_L030062USR", "ONC_BMAG017_L030062USR")
+pairs[[4]] <- c("ONC_BMAG010_L030072USR", "ONC_BMAG017_L030072USR")
+pairs[[5]] <- c("ONC_BMAG010_L040123USR", "ONC_BMAG017_L040123USR")
+pairs[[6]] <- c("ONC_BMAG010_S020005DER", "ONC_BMAG017_S020005DER")
+pairs[[7]] <- c("ONC_BMAG007_S020022DER", "ONC_BMAG017_S020022DER")
+pairs[[8]] <- c("ONC_BMAG007_S020023DER", "ONC_BMAG017_S020023DER")
+pairs[[9]] <- c("ONC_BMAG010_S020024DER", "ONC_BMAG017_S020024DER")
+pairs[[10]] <- c("ONC_BMAG010_S020032DER", "ONC_BMAG017_S020032DER")
+pairs[[11]] <- c("ONC_BMAG010_S020037DER", "ONC_BMAG017_S020037DER")
+pairs[[12]] <- c("ONC_BMAG007_S020039DER", "ONC_BMAG017_S020039DER")
+pairs[[13]] <- c("ONC_BMAG007_S020045DER", "ONC_BMAG017_S020045DER")
+pairs[[14]] <- c("ONC_BMAG010_S020050DER", "ONC_BMAG017_S020050DER")
+pairs[[15]] <- c("ONC_BMAG010_S080081BUT", "ONC_BMAG017_S080081BUT")
+pairs[[16]] <- c("ONC_BMAG010_S080086BUT", "ONC_BMAG017_S080086BUT")
+
+# create empty list for genotype error (discordant loci)
+genoerror <- list()
+
+# create empty list for duplicates (retains first indv in pair)
+dup <- character()
+
+# identify discordant genotypes for each set of duplicates
+for (p in pairs){
+
+# select duplicates from genotype matrix
+geno <- df %>%
+  filter(rowname %in% p) %>%
+  select(-rowname)
+
+# compare genotypes
+comp <- (t(geno))
+
+contigs <- as.data.frame(comp) %>%
+  rownames_to_column(var = "LOCUS") %>%
+  mutate(V1 = as.character(V1),
+         V2 = as.character(V2)) %>%
+  filter(V1 != V2)
+
+# write vector with first individual in pair
+ind <- p[1]
+
+dup <- c(dup, ind)
+
+genoerror[[ind]] <- contigs
+
+}
+
+# if it throws error object V1 or V2 not found it means one or more of the samples names are not correct
+
+# combine into one dataframe
+genoerror <-  ldply(genoerror, data.frame) %>%
+  rename(DUP = `.id`,
+         INDV1 = V1,
+         INDV2 = V2)
+
+total <- as.numeric(length(locNames(gen)))
+
+# compar number of loci by pair
+per_ind <- count(genoerror, DUP) %>%
+  mutate(freq = n/total)
+
+ggplot(per_ind, aes(freq)) +
+  geom_histogram(binwidth = 0.005, fill = "darkorange", color = "black") +
+  scale_x_continuous(limits = c(0, 0.05)) +
+  labs(x = "genotyping error frequency per indv") +
+  theme_standard
+
+```
+
+Identify loci consistently affected by genotyping error.
+
+```{r fig.cap="Fig 51: For discordant loci only: Comparison of genotyping error per locus (freq), number of haplotypes per locus (Haplotypes), number of pairs locus is affected by genotyping error (n), number of times locus is flagged as possible paralog (Poss_Paralog), proportion of individuals haplotyped in (Prop_Haplotyped), and number of SNP sites per locus (Sites).", fig.height=3, fig.width=4}
+
+total <- as.numeric(length(pairs))
+
+# compare loci affected by genotyping error
+per_loc <- count(genoerror, LOCUS) %>%
+  mutate(freq = n/total) %>%
+  rename(Locus = LOCUS)
+
+per_loc <- left_join(per_loc, hap_stats)
+
+plot.hap.stats(per_loc)
+
+```
+
+Remove loci affected by genotyping error in > 50% of pairs and one individual per duplicate set.
+
+```{r}
+
+# remove duplicates
+dup <- strata %>%
+  count(SAMPLE_ID) %>%
+  filter(n == 2)
+
+dup <- strata %>%
+  filter(SAMPLE_ID %in% dup$SAMPLE_ID) %>%
+  arrange(SAMPLE_ID) %>%
+  filter(LIB == "BMAG017")
+
+gen <- gen.ind.rem.Ind(gen, dup$LIB_ID)
+
+# remove flagged loci
+removeloc <- filter(per_loc, n > 8)
+gen <- genind.rem.loci(gen, removeloc$Locus)
+
+writeLines("haplotyped data set after filtering complete")
+gen
+
+```
+
+
+# Final data set
+
+Write files with filtered data set.
+
+```{r}
+
+setPop(gen) <- ~RUN
+
+# convert to tidy data set
+tidy <- tidy_genomic_data(data = gen, filename = NULL) %>%
+  dplyr::select(1:6)
+
+# write tidy data set to file
+write_delim(tidy, "data/POPGEN/ONC.tidy.genotypes", delim = "\t")
+
+# write genepop file
+write_genepop(data = tidy,
+              filename = "data/POPGEN/ONC_haplot_run",
+              genepop.header = "CV chinook salmon grouped by run type")
+
+```
+
+Write files with individuals and contigs still contained in data set and use to filter vcf file.
+
+```{r}
+
+# write bed formatted file with loci to retain
+contigs <- as.data.frame(locNames(gen)) %>%
+  rename(LOCUS = `locNames(gen)`)
+
+keeploci <- loc_stats_F10 %>%
+    select(CHR, POS) %>%
+    filter(CHR %in% contigs$LOCUS)
+
+write_delim(keeploci, "data/VCF/filtered.loci", delim = "\t", col_names = TRUE)
+
+# write list of individuals in the data set
+keepind <- as.data.frame(indNames(gen))
+
+write_delim(keepind, "data/VCF/filtered.ind", delim = "\t", col_names = FALSE)
+
+```
+
+Filter vcf file to contain only SNPs (N = `r nrow(keeploci)`) from SNP-containing loci (`r nrow(contigs)`) retained in data set and output in 012 format.
+
+```{bash eval=FALSE, echo=TRUE}
+
+# load modules for vcf filtering
+module purge
+module load GCC/6.4.0-2.28  OpenMPI/2.1.2
+module load VCFtools/0.1.15-Perl-5.26.1
+
+# retain only individuals and loci in the filtered/haplotyped data sets
+vcftools --vcf data/VCF/temp/ONC.F10.recode.vcf --out data/POPGEN/ONC.haps.filtered --keep data/VCF/filtered.ind --recode --recode-INFO-all
+
+# write 012 output
+vcftools --vcf data/POPGEN/ONC.haps.filtered.recode.vcf --out data/POPGEN/ONC.haps.filtered --012
+
+# stat files
+vcftools --vcf data/POPGEN/ONC.haps.filtered.recode.vcf --out data/VCF/ONC.haps.fil --depth
+vcftools --vcf data/POPGEN/ONC.haps.filtered.recode.vcf --out data/VCF/ONC.haps.fil --site-mean-depth
+vcftools --vcf data/POPGEN/ONC.haps.filtered.recode.vcf --out data/VCF/ONC.haps.fil --missing-indv
+vcftools --vcf data/POPGEN/ONC.haps.filtered.recode.vcf --out data/VCF/ONC.haps.fil --missing-site
+vcftools --vcf data/POPGEN/ONC.haps.filtered.recode.vcf --out data/VCF/ONC.haps.fil --het
+vcftools --vcf data/POPGEN/ONC.haps.filtered.recode.vcf --out data/VCF/ONC.haps.fil --hardy
+vcftools --vcf data/POPGEN/ONC.haps.filtered.recode.vcf --out data/VCF/ONC.haps.fil --site-quality
+vcftools --vcf data/POPGEN/ONC.haps.filtered.recode.vcf --out data/VCF/ONC.haps.fil --geno-depth
+
+```
+
+Compare stats for final filtered data set:
+
+```{r fig.cap="Fig 52: Genotype call rate, missing data, and read depth across loci and individuals for final data set (SNPs retained in haplotyped data set).", fig.height=20, fig.width=10}
+
+# load stats files ----
+ind_stats_fil <- read.ind.stats(dir = "data/VCF", vcf = "ONC.haps.fil") %>%
+  separate(INDV, into = c("SP", "LIB", "SAMPLE_ID"), sep = "_", remove = FALSE)
+
+loc_stats_fil <- read.loc.stats(dir = "data/VCF/", vcf = "ONC.haps.fil")
+
+# plot missing data per indv ----
+p1 <- ggplot(ind_stats_fil, aes(x = MISS_ONC.haps.fil)) +
+  geom_histogram(binwidth = .01, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(MISS_ONC.haps.fil, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 0.25),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "missing data per indv") +
+  theme_standard
+
+# plot Fis per indv ----
+p2 <- ggplot(ind_stats_fil, aes(x = Fis_ONC.haps.fil)) +
+  geom_histogram(binwidth = .01, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(Fis_ONC.haps.fil, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 0),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "Fis per indv") +
+  theme_standard
+
+# plot read depth per indv ----
+p3 <- ggplot(ind_stats_fil, aes(x = MEAN_DEPTH_ONC.haps.fil)) +
+  geom_histogram(binwidth = 10, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(MEAN_DEPTH_ONC.haps.fil, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 20),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "mean read depth per indv") +
+  theme_standard
+
+# plot depth vs missing ----
+p4 <- ggplot(ind_stats_fil, aes(x = MEAN_DEPTH_ONC.haps.fil, y = MISS_ONC.haps.fil)) +
+  geom_point() +
+  geom_vline(aes(xintercept = mean(MEAN_DEPTH_ONC.haps.fil, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 20),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = mean(MISS_ONC.haps.fil, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 0.25),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "mean depth per indv", y = "% missing data") +
+  theme_standard
+
+# plot Fis vs missing data per indv ----
+p5 <- ggplot(ind_stats_fil, aes(x = Fis_ONC.haps.fil, y = MISS_ONC.haps.fil)) +
+  geom_point() +
+  geom_vline(aes(xintercept = mean(Fis_ONC.haps.fil, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 0),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = mean(MISS_ONC.haps.fil, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 0.25),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "Fis per indv", y = "% missing data") +
+  theme_standard
+
+# plot Fis vs mean depth per indv ----
+p6 <- ggplot(ind_stats_fil, aes(x = Fis_ONC.haps.fil, y = MEAN_DEPTH_ONC.haps.fil)) +
+  geom_point() +
+  geom_vline(aes(xintercept = mean(Fis_ONC.haps.fil, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 0),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = mean(MEAN_DEPTH_ONC.haps.fil, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 20),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "Fis per indv", y = "mean depth per indv") +
+  theme_standard
+
+# plot distribution missing data per locus ----
+p7 <- ggplot(ind_stats_fil, aes(x = MISS_ONC.haps.fil)) +
+  geom_histogram(binwidth = 0.01, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(MISS_ONC.haps.fil, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 0.1),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "% missing data per locus") +
+  theme_standard
+
+# plot distribution mean read depth ----
+p8 <- ggplot(loc_stats_fil, aes(x = MEAN_DEPTH_ONC.haps.fil)) +
+  geom_histogram(binwidth = 5, color = "black", fill = "darkorange") +
+  geom_vline(aes(xintercept = mean(MEAN_DEPTH_ONC.haps.fil, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 20),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "mean read depth per locus") +
+  theme_standard
+
+# plot read depth vs missing data ----
+p9 <- ggplot(loc_stats_fil, aes(x = MEAN_DEPTH_ONC.haps.fil, y = MISS_ONC.haps.fil)) +
+  geom_point() +
+  geom_vline(aes(xintercept = mean(MEAN_DEPTH_ONC.haps.fil, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 20),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = mean(MISS_ONC.haps.fil, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 0.1),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "mean depth per locus", y = "% missing data") +
+  theme_standard
+
+# plot depth vs SNP quality ----
+site_qual <- read.table("data/VCF/ONC.haps.fil.lqual",
+                        header = TRUE, stringsAsFactors = FALSE) %>%
+  mutate(PROB = 10^(-QUAL/10))
+
+temp <- data.frame(loc_stats_fil$MEAN_DEPTH_ONC.haps.fil, site_qual$QUAL) %>%
+  rename(depth = loc_stats_fil.MEAN_DEPTH_ONC.haps.fil, qual = site_qual.QUAL)
+
+p10 <- ggplot(temp, aes(x = depth, y = qual)) +
+  geom_point(size = 1) +
+  geom_vline(aes(xintercept = mean(depth, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = 20),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = mean(qual, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1) +
+  geom_hline(aes(yintercept = 20),
+                 color = "darkblue", linetype = "dashed", size = 1) +
+  labs(x = "mean depth per locus", y = "SNP quality") +
+  theme_standard
+
+multiplot(p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, cols=2)
+
+```
