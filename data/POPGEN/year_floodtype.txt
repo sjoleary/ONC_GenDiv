@@ -1,0 +1,20 @@
+YEAR	FLOOD_TYPE
+1996	2+ flood
+1997	2+ flood
+1998	2+ flood
+1999	2+ flood
+2000	spring flood
+2001	no flood
+2002	winter flood
+2003	2+ flood
+2004	2+ flood
+2007	no flood
+2008	no flood
+2009	no flood
+2010	winter flood
+2011	spring flood
+2015	no flood
+2016	spring flood
+2017	2+ flood
+2018	spring flood
+2019	2+ flood
