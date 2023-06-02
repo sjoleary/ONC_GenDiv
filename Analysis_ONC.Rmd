@@ -36,6 +36,7 @@ library(pegas)
 library(radiator)
 library(assigner)
 library(poppr)
+library(vegan)
 
 
 # load custom functions
@@ -211,6 +212,9 @@ setPop(gen_fall) <- ~LOCATION
 gen_spring <- gen_runs[["Spring"]]
 setPop(gen_spring) <- ~LOCATION
 
+# set seed for random proceses
+set.seed(42)
+
 ```
 
 # Genotyping
@@ -240,7 +244,7 @@ kable(
 
 ```
 
-*For details on bioinformatics to genotype the data set see `Demultiplex.html` and `Genotyping.html`.
+*For details on bioinformatics on genotyping the data set see `Demultiplex.html` and `Genotyping.html`*
 
 
 # Assessment of population structure and differentiation
@@ -409,7 +413,7 @@ kable(
 
 ```
 
-Genetic data is scaled and centered, then transformed using a PCA. Retained PCs are then transmitted to a linear discrimant analysis.
+Genetic data is scaled and centered, then transformed using a PCA. Retained PCs are then transmitted to a linear discriminant analysis.
 
 Calculate membership probability of each individual to per cluster.
 
@@ -515,6 +519,81 @@ ggplot(tmp, aes(x = POP1, y = POP2, fill = FST)) +
     labs(x = " ", y = " ") +
     theme_standard +
     theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 0.5))
+
+```
+
+
+## Isolation by distance
+
+Presence of an isolation by distance effect among all tributary run groups was determined by testing for correlation between genetic distance (Fst/(1-Fst)) and river distance using a partial Mantel test to account for run type. Similarly, Mantel tests were used to test for isolation by distance among Fall and Spring runs only. Significance was determined using 9999 permutations.
+
+Mantel tests test for correlation between two distance or dissimilarity matrices. Similarly, a partial Mantel test determines partial correlation between two matrices conditioned on a third matrix. This is accomplished by calculating the correlation of residuals for each of the two distance or dissimilarity matrices after a linear regression on the third matrix.
+
+Significance of the calculated correlation coefficient is determine using permutations. For a mantel test only the first matrix is permuted, the second is kept constant. Similarly, for a partial Mantel test only the first matrix is permuted to ensure the correlation between the first and second matrices is kept constant.
+
+```{r}
+
+# read in fst matrix
+gen_dist <- read_delim("data/POPGEN/all_dist_gen.csv", delim = ",") %>%
+  column_to_rownames("rownames") %>%
+  as.matrix()
+
+# read in distance matrix
+river_dist <- read_delim("data/POPGEN/all_dist_geog.csv", delim = ",") %>%
+  column_to_rownames("rownames") %>%
+  as.matrix()
+
+# create strata to correct for run type
+IBD_strata <- read_delim("data/POPGEN/pairwise_run_strata.txt", delim = "\t") %>%
+  column_to_rownames("rownames") %>%
+  as.matrix()
+
+# test for for all pairs IBD using mantel test
+mantel.partial(xdis = gen_dist,
+               ydis = river_dist,
+               zdis = IBD_strata, permutations = 9999)
+
+```
+
+Test for correlations between river distance and Fst within Fall run tributaries only using Mantel Test.
+
+```{r}
+
+# read in fst matrix
+gen_dist <- read_delim("data/POPGEN/Fall_dist_gen.csv", delim = ",") %>%
+  column_to_rownames("rownames") %>%
+  as.matrix()
+
+# read in distance matrix
+river_dist <- read_delim("data/POPGEN/Fall_dist_geog.csv", delim = ",") %>%
+  column_to_rownames("rownames") %>%
+  as.matrix()
+
+# test for IBD correcting for run type
+mantel(xdis = gen_dist,
+              ydis = river_dist,
+              method = "pearson", permutations = 9999)
+
+```
+
+Look for IBD withing Spring populations.
+
+```{r}
+
+# read in fst matrix
+gen_dist <- read_delim("data/POPGEN/Spring_dist_gen.csv", delim = ",") %>%
+  column_to_rownames("rownames") %>%
+  as.matrix()
+
+# read in distance matrix
+river_dist <- read_delim("data/POPGEN/Spring_dist_geog.csv", delim = ",") %>%
+  column_to_rownames("rownames") %>%
+  as.matrix()
+
+# test for IBD correcting for run type
+mantel(xdis = gen_dist,
+               ydis = river_dist,
+               method = "pearson", permutations = 9999)
 
 ```
 
@@ -683,6 +762,24 @@ perl linkNe.pl -i ONC_SNP.maf01.F_BUT_genepop.gen -map ONC_SNP.thinned.maf01.map
 
 ```
 
+Output contains the following information:
+
+* MIDPOINT_C: The midpoint recombination rate of the bin
+* MEAN_C: The mean recombination rate of the bin
+* NE: The point estimate of effective population size
+* PARA_95_LOW: Lower bound of 95% parametric confidence interval
+* PARA_95_HIGH: Upper bound of 95% parametric confidence interval
+* PAIRWISE: Number of pairwise locus comparisons used in the estimate
+* S: Mean sample size
+* CV: Coefficient of variation - from Hill (1981)
+* EMP_95_LOW: Lower bound of 95% confidence interval based on CV from Hill (1981)
+* EMP_95_HIGH: Upper bound of 95% confidence interval based on CV from Hill (1981)
+* MEAN_R_SQ: Mean total r-square
+* MEAN_EXP_R_SQ: Mean expected r-square
+* R_SQ_DRIFT: R-square attributable to drift
+* R_SQ_DRIFT_LOW: Lower bound of 95% confidence interval for r-square drift
+* R_SQ_DRIFT_HIGH: Upper bound of 95% confidence interval for r-square drift
+
 The largest c-values contain the the contemporary Ne estimates.
 
 ```{r}
@@ -702,20 +799,58 @@ for(f in files){
 
 # combine into single df
 Ne <- ldply(Ne, data.frame) %>%
-  mutate(POP = str_sub(`.id`, 9, -4)) %>%
-  filter(MIDPOINT_C == 0.475) %>%
-  select(POP, NE, PARA_95_LOW, PARA_95_HIGH)
+  mutate(RUN_LOC = str_sub(`.id`, 9, -4)) %>%
+  separate(RUN_LOC, into = c("RUN", "LOCATION"), remove = FALSE) %>%
+  mutate(RUN = case_when(RUN == "F" ~ "Fall",
+                         RUN == "S" ~ "Spring",
+                         RUN == "L" ~ "Late-Fall",
+                         RUN == "W" ~ "Winter"),
+         SOURCE = ifelse(LOCATION %in% c("COL", "FRH", "NIM", "MRH"), "HATCHERY", "WILD"),
+         RUN = ordered(RUN, levels = run_levels),
+         LOCATION = ordered(LOCATION, levels = tributaries),
+         RUN_LOC = ordered(RUN_LOC, levels = trib_runs),
+         GENERATION_TIME = 1/(2*MIDPOINT_C))
+  
 
 kable(
   Ne %>%
-    mutate(POP = ordered(POP, levels = trib_runs)) %>%
-    arrange(POP),
+    filter(MIDPOINT_C == 0.475) %>%
+    select(RUN_LOC, NE, PARA_95_LOW, PARA_95_HIGH) %>%
+    arrange(RUN_LOC),
   digits = 0,
-  caption = "Estimates of effective population size for tributary/run groups using LinkNe."
+  caption = "Table S3: Estimates of effective population size for tributary/run groups using LinkNe."
 )
 
 ```
 
+Negative estimates indicate that the sample size is too small to get an estimate. We'll code those as `NA` to be able to look at estimates of Ne over time.
+
+```{r}
+
+Ne <- Ne %>%
+  mutate(NE = ifelse(NE < 0, NA, NE),
+         PARA_95_HIGH = ifelse(PARA_95_HIGH < 0, NA, PARA_95_HIGH),
+         PARA_95_LOW = ifelse(PARA_95_LOW < 0, NA, PARA_95_LOW))
+
+```
+
+Let's compare the change in effective population size over time.
+
+```{r fig.cap="Change in effective population size Ne over time. Assuming linear change recombination rates and generation times are related as t = 1/(2c); for Chinook salmon generation times are approximately 6-8 years. For Fall runs in Deer and Mill Creek and Spring Feather River Hatchery sample sizes are too low relative to Ne to obtain estimates. For Spring Feather River Hatchery point estimates could only be obtaimed for most distant past (20 generation times) and has been excluded from this figure.", fig.height=21, echo=FALSE}
+
+Ne %>%
+  filter(!RUN_LOC %in% c("S_FRH")) %>%
+  filter(!is.na(NE)) %>%
+ggplot(aes(x = GENERATION_TIME, y = NE, color = RUN, shape = SOURCE)) +
+  geom_line(size = .75) +
+  geom_point(size = 1, stroke = 1, fill = "white") +
+  facet_grid(RUN_LOC ~ ., scales = "free") +
+  scale_color_manual(values = run_col) +
+  scale_shape_manual(values = c(21, 22)) +
+  labs(x = "generation times", y = "effective population size Ne") +
+  theme_facet
+
+```
 
 # Assessment of genomic diversity
 
@@ -955,6 +1090,7 @@ kable(
 mean <- het %>%
     group_by(GRP) %>%
     summarize(mean = mean(Ho),
+              sd = sd(Ho),
               median = median(Ho),
               Q1 = quantile(Ho, 0.25),
               Q3 = quantile(Ho, 0.75))
@@ -962,7 +1098,7 @@ mean <- het %>%
 kable(
     mean,
     digits = 4,
-    caption = "Table S3: Mean, median, 25th, and 75th quartile of observed heterozygosity across loci for individuals grouped by run type & tributary."
+    caption = "Table S4: Mean, standard deviation, median, 25th, and 75th quartile of observed heterozygosity across loci for individuals grouped by run type & tributary."
     )
 
 ```
@@ -1098,13 +1234,14 @@ kable(
 mean <- het %>%
     group_by(GRP) %>%
     summarize(mean = mean(Hs),
+              sd = sd(Hs),
               median = median(Hs),
               Q1 = quantile(Hs, 0.25),
               Q3 = quantile(Hs, 0.75))
 
 kable(
     mean,
-    caption = "Table S4: Mean, median, 25th, and 75th quartile of observed heterozygosity per locus for individuals grouped by run type & tributary.",
+    caption = "Table S5: Mean, standard deviation, median, 25th, and 75th quartile of observed heterozygosity per locus for individuals grouped by run type & tributary.",
     digits = 4
     )
 
@@ -1241,6 +1378,7 @@ ggplot(ar, aes(x = pop, y = AR, color = RUN, group = pop)) +
 mean <- ar %>%
     group_by(pop) %>%
     summarize(mean = mean(AR),
+              sd = sd(AR),
               median = median(AR),
               Q1 = quantile(AR, 0.25),
               Q3 = quantile(AR, 0.75))
@@ -1252,13 +1390,13 @@ kable(
            p_adj = round(p.adjust(p.value, method = "BH"), digits = 4)) %>%
     filter(stat > 0 & p_adj < 0.05) %>%
     arrange(desc(stat)),
-  caption = "Table S5 Significance of pairwise comparisons of allele counts per locus for individuals grouped by run type within tributaries."
+  caption = "Table S6 Significance of pairwise comparisons of allele counts per locus for individuals grouped by run type within tributaries."
 )
 
 
 kable(
     mean,
-    caption = "Table S6: Mean, median, 25th, and 75th quartile of allelic richness across loci for individuals grouped by run type & tributary.",
+    caption = "Table S7: Mean, standard deviation, median, 25th, and 75th quartile of allelic richness across loci for individuals grouped by run type & tributary.",
     digits = 2
     )
 
@@ -1395,14 +1533,15 @@ ggplot(even, aes(x = GRP, y = EVENNESS, color = RUN, GRP = GRP)) +
 # summary stats
 mean <- even %>%
     group_by(GRP) %>%
-    summarize(mean = mean(EVENNESS),
-              median = median(EVENNESS),
-              Q1 = quantile(EVENNESS, 0.25),
-              Q3 = quantile(EVENNESS, 0.75))
+    summarize(mean = mean(EVENNESS, na.rm = TRUE),
+              sd = sd(EVENNESS, na.rm = TRUE),
+              median = median(EVENNESS, na.rm = TRUE),
+              Q1 = quantile(EVENNESS, 0.25, na.rm = TRUE),
+              Q3 = quantile(EVENNESS, 0.75, na.rm = TRUE))
 
 kable(
     mean,
-    caption = "Table S7: Mean, median, 25th, and 75th quartile of evenness of allelic richness per locus for individuals grouped by run type & tributary.",
+    caption = "Table S8: Mean, standard deviation, median, 25th, and 75th quartile of evenness of evenness per locus for individuals grouped by run type & tributary.",
     digits = 4
     )
 
@@ -1647,7 +1786,7 @@ mean <- theta %>%
 kable(
   mean,
   digits = 6,
-  caption = "Table S8: Comparison of mean +/- standard deviation, minimum, and maximum values of the nucleotide diversity (pi) across loci among individuals grouped by run within tributary."
+  caption = "Table S9: Comparison of mean +/- standard deviation, minimum, and maximum values of the nucleotide diversity (pi) across loci among individuals grouped by run within tributary."
 )
 
 ```
@@ -1769,7 +1908,7 @@ mean <- fixed %>%
 kable(
     mean,
     digits = 2,
-    caption = "Table S9: Comparison of mean, median, 25th and 75th quantile of global diversity at fixed loci for individuals grouped by run/tributary."
+    caption = "Table S10: Comparison of mean, median, 25th and 75th quantile of global diversity at fixed loci for individuals grouped by run/tributary."
     )
 
 ```
@@ -1871,7 +2010,7 @@ kable(
         filter(sign == "significant") %>%
         select(-sign),
     digits = 2,
-    caption = "Table S10: Chromosomes with significantly higher/lower than expected (outside simulated null distribution) number of fixed loci for each run/tributary group."
+    caption = "Table S11: Chromosomes with significantly higher/lower than expected (outside simulated null distribution) number of fixed loci for each run/tributary group."
     )
 
 
@@ -1883,7 +2022,7 @@ kable(
                   min = min(percent),
                   max = max(percent)),
     digits = 2,
-    caption = "Table S11: Mean +/- sd, minimum, and maximum percent of loci per chromosome that are fixed across a group of individuals with the same run type for a given tributary."
+    caption = "Table S12: Mean +/- sd, minimum, and maximum percent of loci per chromosome that are fixed across a group of individuals with the same run type for a given tributary."
     )
 
 ```
@@ -2034,14 +2173,15 @@ ggplot(ind_singletons, aes(x = RUN_LOC, y = n, color = RUN)) +
 mean <- ind_singletons %>%
     group_by(RUN_LOC) %>%
     summarize(mean = mean(n),
-          median = median(n),
-          Q1 = quantile(n, 0.25),
-          Q3 = quantile(n, 0.75))
+              sd = sd(n),
+              median = median(n),
+              Q1 = quantile(n, 0.25),
+              Q3 = quantile(n, 0.75))
 
 kable(
     mean,
     digits = 2,
-    caption = "Table S12: Mean, median, 25th and 27th quantile of the number of singletons observer per individual for individuals grouped by run/tributary."
+    caption = "Table S13: Mean, standard deviation, median, 25th and 27th quantile of the number of singletons observer per individual for individuals grouped by run/tributary."
     )
 
 ```
@@ -2246,7 +2386,7 @@ kable(
                     min = min(percent),
                     max = max(percent)),
       digits = 2,
-      caption = "Table S13: Comparison across run/tributary group of the mean +/- sd, minimum, and maximum percent of loci on a chromosome that are only polymorphic for a set of individuals from the same tributary of the same run type."
+      caption = "Table S14: Comparison across run/tributary group of the mean +/- sd, minimum, and maximum percent of loci on a chromosome that are only polymorphic for a set of individuals from the same tributary of the same run type."
       )
 
 # group patterns
@@ -2254,7 +2394,7 @@ kable(
     sign %>%
       count(GRP, sign) %>%
       arrange(desc(n)),
-    caption = "Table S14: Number of chromosomes with significantly more/less loci with private polymorphisms than expected."
+    caption = "Table S15: Number of chromosomes with significantly more/less loci with private polymorphisms than expected."
     )
 
 
@@ -2263,7 +2403,7 @@ kable(
     sign %>%
       count(CHROMOSOME, sign) %>%
       arrange(desc(n)),
-    caption = "Table S15: Number of run/trib groups a chromosome has been flagged as having significantly more/less loci with private polymorphisms than expected."
+    caption = "Table S16: Number of run/trib groups a chromosome has been flagged as having significantly more/less loci with private polymorphisms than expected."
     )
 
 
@@ -2327,7 +2467,7 @@ kable(
               min = min(count)) %>%
     ungroup() %>%
     arrange(desc(max)),
-  caption = "Table S11: Summary stats of number of individuals carrying private alleles (individuals grouped by run type within tributaries."
+  caption = "Table S17: Summary stats of number of individuals carrying private alleles (individuals grouped by run type within tributaries."
 )
 
 ```
@@ -2398,7 +2538,7 @@ by_loc <- pattern %>%
 kable(
       by_loc,
       digits = 2,
-      caption = "Table S13: Comparison across run/tributary group of the mean +/- sd, minimum, and maximum percent of loci on a chromosome that are only polymorphic for a set of individuals from the same tributary of the same run type."
+      caption = "Table S18: Comparison across run/tributary group of the mean +/- sd, minimum, and maximum percent of loci on a chromosome that are only polymorphic for a set of individuals from the same tributary of the same run type."
       )
 
 ```
@@ -2460,7 +2600,7 @@ kable(
       group_by(sign) %>%
       arrange(desc(CHROMOSOME)),
     digits = 4,
-    caption = "Table S14: Chromosomes with significantly higher/lower than expected (outside simulated null distribution) number of fixed loci for each run/tributary group"
+    caption = "Table S19: Chromosomes with significantly higher/lower than expected (outside simulated null distribution) number of fixed loci for each run/tributary group"
     )
 
 # chromosome patterns
@@ -2468,7 +2608,7 @@ kable(
     sign %>%
       count(CHROMOSOME, sign) %>%
       arrange(desc(n)),
-    caption = "Table S15: Number of run/trib groups a chromosome has been flagged as having significantly more/less loci with exclusive polymorphisms than expected."
+    caption = "Table S20: Number of run/trib groups a chromosome has been flagged as having significantly more/less loci with exclusive polymorphisms than expected."
     )
 
 # group patterns
